@@ -1,0 +1,120 @@
+# tsm
+
+[Русский](README.ru.md)
+
+A tmux snapshot manager written in Rust. macOS / Linux, tmux 3.3+.
+
+## Getting started
+
+```sh
+cargo build --release
+./target/release/tsm
+```
+
+Install into `~/.cargo/bin`:
+
+```sh
+cargo install --path . --locked
+```
+
+## CLI
+
+```sh
+tsm save
+tsm save window -n "Marginalia"
+tsm save session -n "Personal projects"
+tsm save all -n "Everything"
+tsm peek
+tsm peek session -n "Personal projects"
+tsm peek all
+tsm save window -n "Marginalia" --dry-run
+tsm list
+tsm list -f "Pers"
+tsm inspect "Personal projects"
+tsm restore "Marginalia"
+tsm restore
+tsm delete "Marginalia"
+tsm rm "Personal projects"
+tsm merge id-1 id-2 -n "Merged sessions"
+tsm merge id-3 --into id-4 -n "Updated id-4"
+tsm list --color always
+```
+
+`peek [window|session|all] [-n NAME]` displays the current state in the same format as `inspect`, using the same capture logic as `save`. `save --dry-run` does the same. Neither command reads or creates the snapshot store, and no files are written. The displayed UUID is temporary; a subsequent `save` generates a new one. Window/session capture must run inside tmux; capturing all sessions requires an accessible tmux server.
+
+`inspect`, `restore`, `delete`, and `merge` accept an exact name, a full UUID, or any unique UUID prefix, with or without hyphens. `list` displays at least 8 characters and extends the ID when prefixes collide. An ambiguous ID or name produces an error listing the matching UUIDs. Each save creates a new snapshot; duplicate names are allowed.
+
+Colors are enabled automatically in a terminal and disabled when output is redirected, `NO_COLOR` is nonempty, or `TERM=dumb`. The global `--color auto|always|never` option controls command output colors.
+
+`delete` (alias `rm`) removes the selected snapshot without further confirmation. Running tmux sessions are unaffected.
+
+Without `--into`, `merge` requires at least two snapshots and creates a new UUID. Without `-n`, their names are joined with `", "`. With `--into`, one source snapshot is enough: the target is updated atomically, retaining its UUID, creation date, and name; `-n` overrides its name. Source snapshots remain in the store. Supplying the same UUID more than once, including the target among the sources, produces an error.
+
+Tmux sessions with the same name are combined by appending their windows; differently named sessions remain separate. All windows and panes are retained, even when their contents are identical. If a window index conflicts, the incoming window receives the lowest available index; other indexes are preserved. Pane layouts and commands are unchanged. The active window comes from the first snapshot containing that session (the `--into` target comes first). The result has scope `session` if it contains one session, otherwise `all`.
+
+Filtering matches a case-insensitive name prefix (including Cyrillic) or a UUID prefix. `Pers` matches `Personal projects`, but not `My Personal projects`. No wildcard is needed.
+
+`save` / `save window` and `save session` run inside tmux. The source is determined by `TMUX_PANE`, not by another client's most recently active session. `save all` captures all sessions on the **current tmux server**.
+
+`restore` without an argument restores the most recent snapshot:
+
+- Window snapshot inside tmux → a new window in the current session.
+- Window snapshot outside tmux → a new session named after the snapshot.
+- Session / all → new sessions; name conflicts are resolved by appending `-restored-N`.
+- Existing windows and sessions are not replaced. There is no automatic attach or switch.
+- If creation fails, only objects created by that restore are removed. Side effects of programs already started cannot be undone.
+
+## TUI
+
+Run `tsm` without arguments:
+
+| Key | Action |
+| --- | --- |
+| ↑/↓, j/k | Select a snapshot; scroll when the inspector is focused |
+| Tab / Enter | Switch focus between the list and inspector |
+| PgUp / PgDn, Home | Scroll the inspector / jump to the top |
+| / | Enter a prefix filter; Enter/Esc finishes editing |
+| w / s / a | Save window / session / all; enter a name or press Enter for the default |
+| r | Restore the selected snapshot |
+| d / Delete | Delete the selected snapshot: y confirms, n/Esc cancels |
+| i | Toggle details: UUID, layout, active windows/panes, zoom, original command |
+| g | Reload snapshots from disk |
+| q / Ctrl-C | Quit |
+
+## What is saved
+
+Session and window names, window indexes, layouts, active windows and panes, zoom state, pane titles, working directories, running programs, and arguments. Arguments are read separately from the process environment using `KERN_PROCARGS2` on macOS and `/proc/PID/cmdline` on Linux. Shell quoting preserves arguments containing spaces and special characters.
+
+The current `tsm` invocation is excluded from snapshot commands using its PID and process tree, including when launched through a shell wrapper or a renamed binary. That pane retains its layout, title, and working directory, but all command fields (`command`, `command_line`, `argv`, `start_command`) are cleared. Restoring it opens a regular shell. The same rule applies to `peek`, `save --dry-run`, and saving from the TUI.
+
+Restoring **restarts** programs. Process memory, terminal scrollback, unsaved editor buffers, shell history, environment variables, pipelines, and background jobs are not saved. For an arbitrary pipeline, one foreground process group leader is identified; the complete original shell command is not guaranteed. Interactive shells and `tsm` itself are replaced with a new shell from `default-shell`; shell scripts with arguments are restarted.
+
+A missing working directory causes an error before any objects are created. Panes running short-lived commands are retained through `remain-on-exit`. Programs may subsequently change pane titles themselves. Geometry may be scaled to fit a different terminal size. Windows linked across sessions are restored as separate copies. Tmux options other than those needed for restoration are not archived.
+
+## Storage
+
+One JSON file per UUID, written atomically with `0600` permissions. New saves do not overwrite existing snapshots; `merge --into` atomically replaces only the target:
+
+- macOS: `~/Library/Application Support/dev.tsm.tsm/snapshots/`
+- Linux: `$XDG_DATA_HOME/tsm/snapshots/`, usually `~/.local/share/tsm/snapshots/`.
+- `TSM_DATA_DIR` overrides the snapshot directory directly.
+- `TSM_TMUX_SOCKET` specifies a tmux socket path for a separate server.
+
+Corrupt and unsupported snapshots are skipped with a warning. Commands may contain secrets in their arguments; the JSON stores those arguments, but not the full environment.
+
+## Verification
+
+```sh
+cargo fmt --check
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo test --test tmux_roundtrip -- --ignored
+```
+
+The regular tests also cover CLI colors, deletion, merging, and preservation of files when operations fail. The final command runs tests on isolated temporary tmux servers: layouts, arguments, all scopes, queries, rollback, restoring merged snapshots, and TUI interaction. It requires permission to launch tmux and inspect processes. Your existing tmux server is not used.
+
+## Structure
+
+`model` — snapshot format and validation; `store` — file storage; `query` — lookup and short IDs; `tmux/client` — tmux calls; `capture` / `restore` — capture and restoration; `process` / `command` — arguments and command execution; `cli` / `tui` — interfaces.
+
+Ratatui is pinned to 0.30.2: accurate scrolling uses the `unstable-rendered-line-info` feature. Pane creation behavior was checked against the [tmux source](https://github.com/tmux/tmux/blob/master/cmd-split-window.c).

@@ -1,0 +1,19 @@
+[package]
+name = "tsm"
+version = "0.1.0"
+edition = "2024"
+description = "Save, inspect, and restore tmux sessions"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+directories = "6"
+ratatui = { version = "=0.30.2", features = ["unstable-rendered-line-info"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+shell-words = "1"
+libc = "0.2"
+tempfile = "3"
