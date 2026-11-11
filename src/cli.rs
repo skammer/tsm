@@ -1,7 +1,7 @@
 use crate::{
     color::{ColorMode, Colors},
     merge,
-    model::{Scope, Snapshot},
+    model::{Scope, Snapshot, WindowSnapshot},
     query::{SnapshotQuery, short_id},
     store::Store,
     tmux, tui,
@@ -25,7 +25,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Save current window (default), current session, or all sessions
+    /// Save a window (default), a session, or all sessions
     Save {
         #[command(flatten)]
         capture: CaptureArgs,
@@ -41,7 +41,11 @@ enum Commands {
         filter: Option<String>,
     },
     /// Inspect by exact name, UUID, or unique UUID prefix
-    Inspect { snapshot: String },
+    Inspect {
+        snapshot: String,
+        /// Show only this window: index, name, or unique name prefix
+        window: Option<String>,
+    },
     /// Restore latest snapshot (default), or select by name/UUID
     Restore { snapshot: Option<String> },
     /// Delete a saved snapshot (does not affect live tmux sessions)
@@ -62,11 +66,38 @@ enum Commands {
 
 #[derive(Args)]
 struct CaptureArgs {
-    #[arg(value_enum, default_value_t = SaveScope::Window)]
-    scope: SaveScope,
+    /// Scope: window (default), session, or all. Any other value is treated
+    /// as a window target: `save 3`, `save logs`, `save work:2`
+    #[arg(value_name = "SCOPE")]
+    scope: Option<String>,
+    /// Window (index, name, or session:window) or session (name or unique
+    /// prefix) to capture instead of the current one; not valid with scope 'all'
+    #[arg(value_name = "TARGET")]
+    target: Option<String>,
     /// Snapshot name; preview only when using peek or --dry-run
     #[arg(short, long)]
     name: Option<String>,
+}
+
+/// A non-scope first positional becomes the window target, so `save 3`
+/// and `save logs` work without spelling out the `window` scope.
+fn resolve_capture(
+    scope: Option<String>,
+    target: Option<String>,
+) -> Result<(Scope, Option<String>)> {
+    match scope.as_deref() {
+        None => Ok((Scope::Window, target)),
+        Some(value) => match SaveScope::from_str(value, true) {
+            Ok(scope) => Ok((scope.into(), target)),
+            Err(_) => {
+                anyhow::ensure!(
+                    target.is_none(),
+                    "invalid scope '{value}'; expected window, session, or all"
+                );
+                Ok((Scope::Window, Some(value.to_owned())))
+            }
+        },
+    }
 }
 
 #[derive(Clone, ValueEnum)]
@@ -95,11 +126,12 @@ pub fn run(cli: Cli) -> Result<()> {
             capture,
             dry_run: true,
         }) => {
-            let snapshot = tmux::capture(capture.scope.into(), capture.name)?;
+            let (scope, target) = resolve_capture(capture.scope, capture.target)?;
+            let snapshot = tmux::capture(scope, target.as_deref(), capture.name)?;
             println!(
                 "{}\n{}",
                 colors.paint("33", "Preview only — nothing saved. UUID is temporary."),
-                describe(&snapshot, colors)
+                describe(&snapshot, None, colors)?
             );
             Ok(())
         }
@@ -107,7 +139,8 @@ pub fn run(cli: Cli) -> Result<()> {
             capture,
             dry_run: false,
         }) => {
-            let snapshot = tmux::capture(capture.scope.into(), capture.name)?;
+            let (scope, target) = resolve_capture(capture.scope, capture.target)?;
+            let snapshot = tmux::capture(scope, target.as_deref(), capture.name)?;
             let store = Store::discover()?;
             store.save(&snapshot)?;
             let catalog = store.load()?;
@@ -149,8 +182,9 @@ pub fn run(cli: Cli) -> Result<()> {
                         );
                     }
                 }
-                Commands::Inspect { snapshot } => {
-                    println!("{}", describe(catalog.resolve(&snapshot)?, colors))
+                Commands::Inspect { snapshot, window } => {
+                    let snapshot = catalog.resolve(&snapshot)?;
+                    println!("{}", describe(snapshot, window.as_deref(), colors)?);
                 }
                 Commands::Restore { snapshot } => {
                     let snapshot = match snapshot {
@@ -212,7 +246,16 @@ fn print_saved(snapshot: &Snapshot, all: &[Snapshot], colors: Colors) {
     );
 }
 
-fn describe(snapshot: &Snapshot, colors: Colors) -> String {
+fn window_matches(selector: &str, window: &WindowSnapshot) -> bool {
+    selector.parse::<usize>().ok() == Some(window.index)
+        || window.name == selector
+        || window
+            .name
+            .to_lowercase()
+            .starts_with(&selector.to_lowercase())
+}
+
+fn describe(snapshot: &Snapshot, window: Option<&str>, colors: Colors) -> Result<String> {
     let mut lines = vec![
         format!(
             "{}  {}",
@@ -228,9 +271,20 @@ fn describe(snapshot: &Snapshot, colors: Colors) -> String {
             ),
         ),
     ];
+    let mut matched = false;
     for session in &snapshot.sessions {
+        let windows: Vec<_> = session
+            .windows
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| window.is_none_or(|selector| window_matches(selector, w)))
+            .collect();
+        if windows.is_empty() {
+            continue;
+        }
+        matched = true;
         lines.push(colors.paint("1;36", format!("Session: {}", session.name)));
-        for (index, window) in session.windows.iter().enumerate() {
+        for (index, window) in windows {
             lines.push(colors.paint(
                 "1",
                 format!(
@@ -278,5 +332,11 @@ fn describe(snapshot: &Snapshot, colors: Colors) -> String {
             }
         }
     }
-    lines.join("\n")
+    anyhow::ensure!(
+        window.is_none() || matched,
+        "no window '{}' in snapshot '{}'",
+        window.unwrap_or_default(),
+        snapshot.name
+    );
+    Ok(lines.join("\n"))
 }

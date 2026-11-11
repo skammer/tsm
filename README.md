@@ -23,14 +23,21 @@ cargo install --path . --locked
 tsm save
 tsm save window -n "Marginalia"
 tsm save session -n "Personal projects"
+tsm save session work            # session by name or unique prefix
+tsm save window 2                # window by index
+tsm save 3                       # same: a non-scope value is a window target
+tsm save window logs             # window by name or unique prefix
+tsm save window work:2           # window in another session
 tsm save all -n "Everything"
 tsm peek
 tsm peek session -n "Personal projects"
+tsm peek work:logs
 tsm peek all
 tsm save window -n "Marginalia" --dry-run
 tsm list
 tsm list -f "Pers"
 tsm inspect "Personal projects"
+tsm inspect "Personal projects" logs   # only one window of a snapshot
 tsm restore "Marginalia"
 tsm restore
 tsm delete "Marginalia"
@@ -40,7 +47,11 @@ tsm merge id-3 --into id-4 -n "Updated id-4"
 tsm list --color always
 ```
 
-`peek [window|session|all] [-n NAME]` displays the current state in the same format as `inspect`, using the same capture logic as `save`. `save --dry-run` does the same. Neither command reads or creates the snapshot store, and no files are written. The displayed UUID is temporary; a subsequent `save` generates a new one. Window/session capture must run inside tmux; capturing all sessions requires an accessible tmux server.
+`save` and `peek` capture the current window or session by default, or an explicit target: a window by index, name, or unique name prefix (optionally `session:window`), a session by name or unique name prefix. A first positional that is not a scope (`window`/`session`/`all`) is treated as a window target, so `tsm save 3` works. Named targets (`session:window`, a session name) only need an accessible tmux server, not `TMUX_PANE`. A target is not valid with scope `all`.
+
+`peek [window|session|all] [TARGET] [-n NAME]` displays the current state in the same format as `inspect`, using the same capture logic as `save`. `save --dry-run` does the same. Neither command reads or creates the snapshot store, and no files are written. The displayed UUID is temporary; a subsequent `save` generates a new one. Window/session capture of the current window or session must run inside tmux; named targets and `all` only require an accessible tmux server.
+
+`inspect` accepts an optional second positional to show a single window of a snapshot by index, name, or name prefix.
 
 `inspect`, `restore`, `delete`, and `merge` accept an exact name, a full UUID, or any unique UUID prefix, with or without hyphens. `list` displays at least 8 characters and extends the ID when prefixes collide. An ambiguous ID or name produces an error listing the matching UUIDs. Each save creates a new snapshot; duplicate names are allowed.
 
@@ -54,7 +65,7 @@ Tmux sessions with the same name are combined by appending their windows; differ
 
 Filtering matches a case-insensitive name prefix (including Cyrillic) or a UUID prefix. `Pers` matches `Personal projects`, but not `My Personal projects`. No wildcard is needed.
 
-`save` / `save window` and `save session` run inside tmux. The source is determined by `TMUX_PANE`, not by another client's most recently active session. `save all` captures all sessions on the **current tmux server**.
+`save` / `save window` and `save session` without a target run inside tmux. The source is determined by `TMUX_PANE`, not by another client's most recently active session. `save all` captures all sessions on the **current tmux server**.
 
 `restore` without an argument restores the most recent snapshot:
 

@@ -345,6 +345,104 @@ fn peek_and_dry_run_match_capture_without_touching_storage() {
 
 #[test]
 #[ignore = "starts a dedicated tmux server; needs process inspection permissions"]
+fn save_and_peek_accept_window_and_session_targets() {
+    let server = Server::new();
+    let first = server.tmux(&[
+        "new-session",
+        "-d",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "-s",
+        "alpha",
+        "-n",
+        "editor",
+        "/bin/sleep",
+        "120",
+    ]);
+    server.tmux(&[
+        "new-window",
+        "-d",
+        "-t",
+        "alpha",
+        "-n",
+        "logs",
+        "/bin/sleep",
+        "120",
+    ]);
+    server.tmux(&[
+        "new-session",
+        "-d",
+        "-s",
+        "beta",
+        "-n",
+        "other",
+        "/bin/sleep",
+        "120",
+    ]);
+
+    // Window by index and by name in the current session.
+    for selector in ["1", "logs", "LOG"] {
+        let saved = server.tsm(&["save", "window", selector], Some(&first));
+        let snapshot = server.snapshot(saved_id(&saved));
+        assert_eq!(snapshot["scope"], "window");
+        assert_eq!(snapshot["sessions"][0]["name"], "alpha");
+        assert_eq!(snapshot["sessions"][0]["windows"][0]["name"], "logs");
+        assert_eq!(snapshot["sessions"][0]["windows"][0]["index"], 1);
+    }
+    // A bare first positional that is not a scope is a window target.
+    let saved = server.tsm(&["save", "1"], Some(&first));
+    assert_eq!(
+        server.snapshot(saved_id(&saved))["sessions"][0]["windows"][0]["name"],
+        "logs"
+    );
+    // session:window works from outside tmux (no TMUX_PANE).
+    let saved = server.tsm(&["save", "window", "beta:other"], None);
+    let snapshot = server.snapshot(saved_id(&saved));
+    assert_eq!(snapshot["sessions"][0]["name"], "beta");
+    assert_eq!(snapshot["sessions"][0]["windows"][0]["name"], "other");
+    // Session by exact name and by unique prefix, without TMUX_PANE.
+    for (selector, session) in [("beta", "beta"), ("alp", "alpha")] {
+        let saved = server.tsm(&["save", "session", selector], None);
+        let snapshot = server.snapshot(saved_id(&saved));
+        assert_eq!(snapshot["scope"], "session");
+        assert_eq!(snapshot["sessions"][0]["name"], session);
+    }
+    // peek accepts the same targets and shows the non-current window.
+    let peek = server.tsm(&["peek", "window", "beta:0"], None);
+    assert!(peek.contains("Preview only"));
+    assert!(peek.contains("Window 0: other"));
+    // inspect narrows a saved session to a single window.
+    let saved = server.tsm(&["save", "session", "alpha"], Some(&first));
+    let id = saved_id(&saved).to_owned();
+    let inspected = server.tsm(&["inspect", &id, "logs"], None);
+    assert!(inspected.contains("Window 1: logs"));
+    assert!(!inspected.contains("Window 0: editor"));
+
+    for args in [
+        vec!["save", "session", "missing"],
+        vec!["save", "window", "alpha:missing"],
+        vec!["save", "window", "alpha:"],
+        vec!["save", "all", "alpha"],
+        vec!["save", "bogus", "extra"],
+        vec!["peek", "session", "missing"],
+        vec!["inspect", &id, "missing"],
+    ] {
+        let failed = server.tsm_output(&args, None);
+        assert!(!failed.status.success(), "{args:?}");
+    }
+    // Ambiguous session prefix lists the matches.
+    server.tmux(&["new-session", "-d", "-s", "alpine", "/bin/sleep", "120"]);
+    let failed = server.tsm_output(&["save", "session", "alp"], None);
+    assert!(!failed.status.success());
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(stderr.contains("ambiguous"), "{stderr}");
+    assert!(stderr.contains("alpha"), "{stderr}");
+    assert!(stderr.contains("alpine"), "{stderr}");
+}
+
+#[test]
+#[ignore = "starts a dedicated tmux server; needs process inspection permissions"]
 fn all_scopes_commands_layouts_queries_and_rollback() {
     let server = Server::new();
     let first = server.tmux(&[

@@ -144,6 +144,50 @@ fn invalid_merges_and_ambiguous_delete_leave_files_unchanged() {
 }
 
 #[test]
+fn inspect_filters_windows_by_index_name_and_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut snapshot = fixture(&dir, FIRST, "First");
+    snapshot["scope"] = json!("session");
+    snapshot["sessions"][0]["windows"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "index": 7, "name": "logs", "layout": "b25d,80x24,0,0,0",
+            "active_pane": 0, "zoomed": false,
+            "panes": [{"title": "tail", "cwd": "/var", "command": "tail",
+                "command_line": "tail -f x", "argv": ["tail", "-f", "x"],
+                "start_command": "", "active": true}]
+        }));
+    fs::write(
+        dir.path().join(format!("{FIRST}.json")),
+        serde_json::to_vec(&snapshot).unwrap(),
+    )
+    .unwrap();
+
+    for selector in ["3", "First", "fir"] {
+        let shown = success(&dir, &["inspect", "First", selector]);
+        assert!(shown.contains("Window 3: First"), "{selector}");
+        assert!(!shown.contains("Window 7: logs"), "{selector}");
+    }
+    for selector in ["7", "logs", "LOG"] {
+        let shown = success(&dir, &["inspect", "First", selector]);
+        assert!(shown.contains("Window 7: logs"), "{selector}");
+        assert!(!shown.contains("Window 3: First"), "{selector}");
+    }
+    let everything = success(&dir, &["inspect", "First"]);
+    assert!(everything.contains("Window 3: First"));
+    assert!(everything.contains("Window 7: logs"));
+    for selector in ["missing", "9"] {
+        let failed = run(&dir, &["inspect", "First", selector]);
+        assert!(!failed.status.success(), "{selector}");
+        assert!(
+            String::from_utf8_lossy(&failed.stderr).contains("no window"),
+            "{selector}"
+        );
+    }
+}
+
+#[test]
 fn colors_are_opt_in_for_pipes_and_can_be_disabled() {
     let dir = tempfile::tempdir().unwrap();
     fixture(&dir, FIRST, "First");

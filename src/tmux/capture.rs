@@ -3,35 +3,140 @@ use super::{
     process::ProcessTable,
 };
 use crate::model::{PaneSnapshot, Scope, SessionSnapshot, Snapshot, WindowSnapshot};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use uuid::Uuid;
 
-pub fn capture(scope: Scope, custom_name: Option<String>) -> Result<Snapshot> {
-    let current = if scope != Scope::All {
-        Some(current_pane()?)
-    } else {
-        None
+/// A live tmux object (session or window) that a selector can refer to.
+struct Listed {
+    id: String,
+    index: Option<usize>,
+    name: String,
+}
+
+/// Resolve a selector against listed objects: numeric index first, then exact
+/// name, then a unique case-insensitive name prefix.
+fn pick(listed: &[Listed], selector: &str, kind: &str) -> Result<String> {
+    ensure!(!selector.is_empty(), "{kind} selector is empty");
+    if let Ok(index) = selector.parse::<usize>()
+        && let Some(item) = listed.iter().find(|item| item.index == Some(index))
+    {
+        return Ok(item.id.clone());
+    }
+    if let Some(item) = listed.iter().find(|item| item.name == selector) {
+        return Ok(item.id.clone());
+    }
+    let lower = selector.to_lowercase();
+    let prefixed: Vec<_> = listed
+        .iter()
+        .filter(|item| item.name.to_lowercase().starts_with(&lower))
+        .collect();
+    match prefixed.as_slice() {
+        [item] => Ok(item.id.clone()),
+        [] => bail!("{kind} not found: {selector}"),
+        _ => bail!(
+            "ambiguous {kind} '{selector}', matches: {}",
+            prefixed
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn resolve_session(selector: &str) -> Result<String> {
+    let listing = run(&["list-sessions", "-F", "#{session_id}\t#{session_name}"])?;
+    let listed: Vec<Listed> = listing
+        .lines()
+        .map(|line| {
+            let (id, name) = line.split_once('\t').unwrap_or((line, ""));
+            Listed {
+                id: id.to_owned(),
+                index: None,
+                name: name.to_owned(),
+            }
+        })
+        .collect();
+    pick(&listed, selector, "session")
+}
+
+/// Resolve `[session:]window` into `(session_id, window_id)`.
+/// Without a session part the current pane's session is used.
+fn resolve_window(selector: &str) -> Result<(String, String)> {
+    let (session_selector, window_selector) = match selector.split_once(':') {
+        Some((session, window)) => (Some(session), window),
+        None => (None, selector),
     };
-    let sessions = if let Some(pane) = &current {
-        vec![field(pane, "session_id")?]
-    } else {
-        run(&["list-sessions", "-F", "#{session_id}"])?
+    let session = match session_selector {
+        Some(selector) => resolve_session(selector)?,
+        None => field(&current_pane()?, "session_id")?,
+    };
+    let listing = run(&[
+        "list-windows",
+        "-t",
+        &session,
+        "-F",
+        "#{window_id}\t#{window_index}\t#{window_name}",
+    ])?;
+    let listed: Vec<Listed> = listing
+        .lines()
+        .map(|line| {
+            let mut parts = line.splitn(3, '\t');
+            Listed {
+                id: parts.next().unwrap_or_default().to_owned(),
+                index: parts.next().and_then(|index| index.parse().ok()),
+                name: parts.next().unwrap_or_default().to_owned(),
+            }
+        })
+        .collect();
+    let window = pick(&listed, window_selector, "window")?;
+    Ok((session, window))
+}
+
+enum Windows {
+    All,
+    One(String),
+}
+
+pub fn capture(
+    scope: Scope,
+    target: Option<&str>,
+    custom_name: Option<String>,
+) -> Result<Snapshot> {
+    let plan: Vec<(String, Windows)> = match (&scope, target) {
+        (Scope::All, Some(_)) => bail!("a target is not valid for scope 'all'"),
+        (Scope::All, None) => run(&["list-sessions", "-F", "#{session_id}"])?
             .lines()
-            .map(str::to_owned)
-            .collect()
+            .map(|session| (session.to_owned(), Windows::All))
+            .collect(),
+        (Scope::Session, None) => {
+            let pane = current_pane()?;
+            vec![(field(&pane, "session_id")?, Windows::All)]
+        }
+        (Scope::Session, Some(selector)) => vec![(resolve_session(selector)?, Windows::All)],
+        (Scope::Window, None) => {
+            let pane = current_pane()?;
+            vec![(
+                field(&pane, "session_id")?,
+                Windows::One(field(&pane, "window_id")?),
+            )]
+        }
+        (Scope::Window, Some(selector)) => {
+            let (session, window) = resolve_window(selector)?;
+            vec![(session, Windows::One(window))]
+        }
     };
     let processes = ProcessTable::load()?;
     let mut saved_sessions = Vec::new();
-    for session in sessions {
+    for (session, filter) in plan {
         let name = field(&session, "session_name")?;
-        let windows: Vec<String> = if scope == Scope::Window {
-            vec![field(current.as_deref().unwrap(), "window_id")?]
-        } else {
-            run(&["list-windows", "-t", &session, "-F", "#{window_id}"])?
+        let windows: Vec<String> = match &filter {
+            Windows::One(window) => vec![window.clone()],
+            Windows::All => run(&["list-windows", "-t", &session, "-F", "#{window_id}"])?
                 .lines()
                 .map(str::to_owned)
-                .collect()
+                .collect(),
         };
         let mut saved_windows = Vec::new();
         let mut active_window = 0;

@@ -147,7 +147,7 @@ fn run_loop(terminal: &mut DefaultTerminal, store: &Store) -> Result<()> {
                 KeyCode::Char(c) => app.name.push(c),
                 KeyCode::Enter => {
                     let name = (!app.name.trim().is_empty()).then(|| app.name.clone());
-                    let result = tmux::capture(scope, name).and_then(|snapshot| {
+                    let result = tmux::capture(scope, None, name).and_then(|snapshot| {
                         store.save(&snapshot)?;
                         Ok(snapshot)
                     });

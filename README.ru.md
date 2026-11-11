@@ -23,14 +23,21 @@ cargo install --path . --locked
 tsm save
 tsm save window -n "Marginalia"
 tsm save session -n "Personal projects"
+tsm save session work            # сессия по имени или уникальному префиксу
+tsm save window 2                # окно по индексу
+tsm save 3                       # то же: не-scope значение — цель окна
+tsm save window logs             # окно по имени или уникальному префиксу
+tsm save window work:2           # окно в другой сессии
 tsm save all -n "Everything"
 tsm peek
 tsm peek session -n "Personal projects"
+tsm peek work:logs
 tsm peek all
 tsm save window -n "Marginalia" --dry-run
 tsm list
 tsm list -f "Pers"
 tsm inspect "Personal projects"
+tsm inspect "Personal projects" logs   # только одно окно снапшота
 tsm restore "Marginalia"
 tsm restore
 tsm delete "Marginalia"
@@ -40,7 +47,11 @@ tsm merge id-3 --into id-4 -n "Updated id-4"
 tsm list --color always
 ```
 
-`peek [window|session|all] [-n NAME]` показывает текущее состояние в формате `inspect`, используя тот же сбор данных, что и `save`. `save --dry-run` делает то же самое. Хранилище не читается и не создаётся, файлы не записываются. UUID в выводе временный; последующий `save` создаст новый. Для window/session нужен запуск внутри tmux, для all — доступный tmux-сервер.
+`save` и `peek` по умолчанию сохраняют текущее окно или сессию, либо явную цель: окно — по индексу, имени или уникальному префиксу имени (можно `session:window`), сессию — по имени или уникальному префиксу. Первый позиционный аргумент, не являющийся scope (`window`/`session`/`all`), трактуется как цель окна, поэтому `tsm save 3` работает. Цели по имени (`session:window`, имя сессии) требуют только доступный tmux-сервер, а не `TMUX_PANE`. Цель несовместима со scope `all`.
+
+`peek [window|session|all] [TARGET] [-n NAME]` показывает текущее состояние в формате `inspect`, используя тот же сбор данных, что и `save`. `save --dry-run` делает то же самое. Хранилище не читается и не создаётся, файлы не записываются. UUID в выводе временный; последующий `save` создаст новый. Захват текущего окна/сессии требует запуска внутри tmux; именованные цели и all — только доступный tmux-сервер.
+
+`inspect` принимает необязательный второй позиционный аргумент — показать одно окно снапшота по индексу, имени или префиксу имени.
 
 `inspect`, `restore`, `delete` и `merge` принимают точное имя, полный UUID или любой уникальный префикс UUID, с дефисами или без. `list` показывает минимум 8 символов и удлиняет ID при коллизии. Неоднозначный ID/имя вызывает ошибку со списком UUID. Каждое сохранение создаёт новый snapshot; одинаковые имена разрешены.
 
@@ -54,7 +65,7 @@ tsm list --color always
 
 Фильтр — префикс имени без учёта регистра (включая кириллицу), либо префикс UUID. `Pers` найдёт `Personal projects`, но не `My Personal projects`. Звёздочка не нужна.
 
-`save` / `save window` и `save session` запускаются внутри tmux. Источник определяется по `TMUX_PANE`, а не по последней активной сессии другого клиента. `save all` сохраняет все сессии **текущего tmux-сервера**.
+`save` / `save window` и `save session` без цели запускаются внутри tmux. Источник определяется по `TMUX_PANE`, а не по последней активной сессии другого клиента. `save all` сохраняет все сессии **текущего tmux-сервера**.
 
 `restore` без аргумента восстанавливает самое свежее сохранение:
 
