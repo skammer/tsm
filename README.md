@@ -71,7 +71,9 @@ Filtering matches a case-insensitive name prefix (including Cyrillic) or a UUID 
 
 - Window snapshot inside tmux → a new window in the current session.
 - Window snapshot outside tmux → a new session named after the snapshot.
-- Session / all → new sessions; name conflicts are resolved by appending `-restored-N`.
+- Session snapshot → a new session named after the snapshot.
+- All snapshot → new sessions with their original tmux session names.
+- Name conflicts are resolved by appending `-restored-N`.
 - Existing windows and sessions are not replaced. There is no automatic attach or switch.
 - If creation fails, only objects created by that restore are removed. Side effects of programs already started cannot be undone.
 

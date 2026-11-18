@@ -86,10 +86,10 @@ fn restore_inner(snapshot: &Snapshot, tx: &mut Transaction) -> Result<Vec<String
             ));
             (id.clone(), window, false)
         } else {
-            let preferred = if snapshot.scope == Scope::Window {
-                &snapshot.name
-            } else {
+            let preferred = if snapshot.scope == Scope::All {
                 &session.name
+            } else {
+                &snapshot.name
             };
             let name = unique_name(preferred)?;
             let value = run(&[

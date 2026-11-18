@@ -209,13 +209,7 @@ fn current_save_call_is_not_archived_or_replayed() {
         assert_eq!(panes[1]["argv"], serde_json::json!(["/bin/sleep", "120"]));
 
         server.tsm(&["restore", "Self capture"], None);
-        let restored = server.tmux(&[
-            "list-panes",
-            "-t",
-            "self-capture-restored-1:",
-            "-F",
-            "#{pane_id}",
-        ]);
+        let restored = server.tmux(&["list-panes", "-t", "Self capture:", "-F", "#{pane_id}"]);
         let restored_caller = restored.lines().next().unwrap();
         let mut shell = String::new();
         for _ in 0..40 {
@@ -545,19 +539,29 @@ fn all_scopes_commands_layouts_queries_and_rollback() {
     );
     server.tsm(&["restore", "Personal projects"], None);
     assert_eq!(
+        server.tmux(&[
+            "display-message",
+            "-p",
+            "-t",
+            "=Personal projects:",
+            "#{session_name}"
+        ]),
+        "Personal projects"
+    );
+    assert_eq!(
         geometry(&server, "alpha:3"),
-        geometry(&server, "alpha-restored-1:3")
+        geometry(&server, "Personal projects:3")
     );
     assert_eq!(
         geometry(&server, "alpha:7"),
-        geometry(&server, "alpha-restored-1:7")
+        geometry(&server, "Personal projects:7")
     );
     assert_eq!(
         server.tmux(&[
             "display-message",
             "-p",
             "-t",
-            "alpha-restored-1:",
+            "Personal projects:",
             "#{window_index}"
         ]),
         "3"
@@ -566,7 +570,7 @@ fn all_scopes_commands_layouts_queries_and_rollback() {
         "display-message",
         "-p",
         "-t",
-        "alpha-restored-1:3",
+        "Personal projects:3",
         "#{pane_id}",
     ]);
     let restored = server.tsm(&["save", "session", "-n", "Restored"], Some(&restored_pane));
