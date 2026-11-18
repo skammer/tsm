@@ -63,7 +63,7 @@ Without `--into`, `merge` requires at least two snapshots and creates a new UUID
 
 Tmux sessions with the same name are combined by appending their windows; differently named sessions remain separate. All windows and panes are retained, even when their contents are identical. If a window index conflicts, the incoming window receives the lowest available index; other indexes are preserved. Pane layouts and commands are unchanged. The active window comes from the first snapshot containing that session (the `--into` target comes first). The result has scope `session` if it contains one session, otherwise `all`.
 
-Filtering matches a case-insensitive name prefix (including Cyrillic) or a UUID prefix. `Pers` matches `Personal projects`, but not `My Personal projects`. No wildcard is needed.
+Search matches case-insensitive names, including Cyrillic, or a UUID prefix. `pprj` finds `Personal projects` by matching letters in order. Exact names, UUID prefixes, name prefixes, and substrings rank ahead of fuzzy matches.
 
 `save` / `save window` and `save session` without a target run inside tmux. The source is determined by `TMUX_PANE`, not by another client's most recently active session. `save all` captures all sessions on the **current tmux server**.
 
@@ -85,13 +85,15 @@ Run `tsm` without arguments:
 | --- | --- |
 | ↑/↓, j/k | Select a snapshot; scroll when the inspector is focused |
 | Tab / Enter | Switch focus between the list and inspector |
-| PgUp / PgDn, Home | Scroll the inspector / jump to the top |
-| / | Enter a prefix filter; Enter/Esc finishes editing |
+| PgUp / PgDn | Page through the inspector or the list in a narrow terminal |
+| Home / End | Jump to the start or end of the focused panel |
+| / | Search snapshots. ↑/↓ select, Enter applies, Esc cancels, Ctrl-U clears |
 | w / s / a | Save window / session / all; enter a name or press Enter for the default |
 | r | Restore the selected snapshot |
 | d / Delete | Delete the selected snapshot: y confirms, n/Esc cancels |
 | i | Toggle details: UUID, layout, active windows/panes, zoom, original command |
 | g | Reload snapshots from disk |
+| ? | Show keyboard shortcuts and storage warnings |
 | q / Ctrl-C | Quit |
 
 ## What is saved
@@ -102,7 +104,7 @@ The current `tsm` invocation is excluded from snapshot commands using its PID an
 
 Restoring **restarts** programs. Process memory, terminal scrollback, unsaved editor buffers, shell history, environment variables, pipelines, and background jobs are not saved. For an arbitrary pipeline, one foreground process group leader is identified; the complete original shell command is not guaranteed. Interactive shells and `tsm` itself are replaced with a new shell from `default-shell`; shell scripts with arguments are restarted.
 
-A missing working directory causes an error before any objects are created. Panes running short-lived commands are retained through `remain-on-exit`. Programs may subsequently change pane titles themselves. Geometry may be scaled to fit a different terminal size. Windows linked across sessions are restored as separate copies. Tmux options other than those needed for restoration are not archived.
+A missing working directory causes an error before any objects are created. Restore starts a shell in the saved directory and runs the saved program as a foreground job. After the program exits, the same pane returns to an interactive prompt. Interactive shell startup files may run again when the prompt opens. Programs may subsequently change pane titles themselves. Geometry may be scaled to fit a different terminal size. Windows linked across sessions are restored as separate copies. Tmux options other than those needed for restoration are not archived.
 
 ## Storage
 
@@ -128,6 +130,6 @@ The regular tests also cover CLI colors, deletion, merging, and preservation of 
 
 ## Structure
 
-`model` — snapshot format and validation; `store` — file storage; `query` — lookup and short IDs; `tmux/client` — tmux calls; `capture` / `restore` — capture and restoration; `process` / `command` — arguments and command execution; `cli` / `tui` — interfaces.
+`model` validates snapshots, `store` handles files, and `query` resolves names and IDs. Under `tmux`, `capture` reads live state, `restore` rebuilds layouts, and `launch` starts shells and foreground jobs. The TUI separates input and state (`app`), layout (`view`), and snapshot details (`inspect`).
 
 Ratatui is pinned to 0.30.2: accurate scrolling uses the `unstable-rendered-line-info` feature. Pane creation behavior was checked against the [tmux source](https://github.com/tmux/tmux/blob/master/cmd-split-window.c).

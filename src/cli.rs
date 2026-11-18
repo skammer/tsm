@@ -2,7 +2,7 @@ use crate::{
     color::{ColorMode, Colors},
     merge,
     model::{Scope, Snapshot, WindowSnapshot},
-    query::{SnapshotQuery, short_id},
+    query::{search, short_id},
     store::Store,
     tmux, tui,
 };
@@ -35,7 +35,7 @@ enum Commands {
     },
     /// Inspect live window (default), session, or all sessions without saving
     Peek(CaptureArgs),
-    /// List snapshots; filter matches case-insensitive name or UUID prefix
+    /// List snapshots with fuzzy name search or UUID prefix filtering
     List {
         #[arg(short, long)]
         filter: Option<String>,
@@ -155,7 +155,6 @@ pub fn run(cli: Cli) -> Result<()> {
             }
             match command {
                 Commands::List { filter } => {
-                    let query = SnapshotQuery::new(filter.as_deref().unwrap_or(""));
                     println!(
                         "{}",
                         colors.paint(
@@ -163,11 +162,8 @@ pub fn run(cli: Cli) -> Result<()> {
                             "ID        TYPE     CREATED (UTC)        WINDOWS PANES NAME"
                         )
                     );
-                    for snapshot in catalog
-                        .snapshots
-                        .iter()
-                        .filter(|snapshot| query.matches(snapshot))
-                    {
+                    for index in search(&catalog.snapshots, filter.as_deref().unwrap_or("")) {
+                        let snapshot = &catalog.snapshots[index];
                         println!(
                             "{}  {}  {}  {:>7} {:>5} {}",
                             colors.paint(

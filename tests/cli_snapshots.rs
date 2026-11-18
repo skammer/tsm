@@ -54,6 +54,23 @@ fn read(dir: &TempDir, id: &str) -> Value {
 }
 
 #[test]
+fn list_searches_names_fuzzily_and_keeps_uuid_prefixes() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(&dir, FIRST, "Personal projects");
+    fixture(&dir, SECOND, "Pprj tools");
+
+    let listed = success(&dir, &["list", "-f", "PpRj"]);
+    let mut rows = listed.lines().skip(1);
+    assert!(rows.next().unwrap().ends_with("Pprj tools"));
+    assert!(rows.next().unwrap().ends_with("Personal projects"));
+    assert!(rows.next().is_none());
+    let by_id = success(&dir, &["list", "-f", "AAAAAAAA-1"]);
+    assert!(by_id.contains("Personal projects"));
+    assert!(!by_id.contains("Pprj tools"));
+    assert!(!run(&dir, &["inspect", "pprj"]).status.success());
+}
+
+#[test]
 fn merge_creates_new_snapshot_then_updates_target_without_touching_sources() {
     let dir = tempfile::tempdir().unwrap();
     let first = fixture(&dir, FIRST, "First");

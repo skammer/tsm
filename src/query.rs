@@ -6,6 +6,30 @@ pub struct SnapshotQuery {
     id: Option<String>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Match {
+    Exact,
+    IdPrefix,
+    NamePrefix,
+    Substring,
+    Fuzzy,
+}
+
+pub fn search(snapshots: &[Snapshot], filter: &str) -> Vec<usize> {
+    let filter = filter.trim();
+    if filter.is_empty() {
+        return (0..snapshots.len()).collect();
+    }
+    let query = SnapshotQuery::new(filter);
+    let mut matches: Vec<_> = snapshots
+        .iter()
+        .enumerate()
+        .filter_map(|(index, snapshot)| query.rank(snapshot).map(|rank| (rank, index)))
+        .collect();
+    matches.sort_unstable(); // The catalog index breaks ties by recency.
+    matches.into_iter().map(|(_, index)| index).collect()
+}
+
 impl SnapshotQuery {
     pub fn new(value: &str) -> Self {
         let normalized = value.replace('-', "").to_ascii_lowercase();
@@ -19,8 +43,26 @@ impl SnapshotQuery {
         }
     }
 
-    pub fn matches(&self, snapshot: &Snapshot) -> bool {
-        snapshot.name.to_lowercase().starts_with(&self.name) || self.matches_id(snapshot)
+    fn rank(&self, snapshot: &Snapshot) -> Option<Match> {
+        let name = snapshot.name.to_lowercase();
+        if name == self.name {
+            return Some(Match::Exact);
+        }
+        if self.matches_id(snapshot) {
+            return Some(Match::IdPrefix);
+        }
+        if name.starts_with(&self.name) {
+            return Some(Match::NamePrefix);
+        }
+        if name.contains(&self.name) {
+            return Some(Match::Substring);
+        }
+        let mut letters = name.chars();
+        self.name
+            .chars()
+            .filter(|letter| !letter.is_whitespace())
+            .all(|wanted| letters.by_ref().any(|letter| letter == wanted))
+            .then_some(Match::Fuzzy)
     }
 
     fn matches_id(&self, snapshot: &Snapshot) -> bool {
@@ -94,8 +136,33 @@ mod tests {
             SnapshotQuery::new("aaaaaaaa1").resolve(&all).unwrap().id,
             all[0].id
         );
-        assert!(SnapshotQuery::new("ЛИЧНЫЕ-").matches(&all[0]));
+        assert_eq!(search(&all, "ЛИЧНЫЕ-"), [0]);
+        assert_eq!(search(&all, " ЛЧ ПРК "), [0]);
+        assert_eq!(search(&all, "aaaaAAAA-1"), [0]);
         assert!(SnapshotQuery::new("").resolve(&all).is_err());
         assert!(SnapshotQuery::new("---").resolve(&all).is_err());
+    }
+
+    #[test]
+    fn ranks_exact_prefix_substring_and_subsequence_matches() {
+        let all: Vec<_> = [
+            "Personal projects",
+            "My PPR",
+            "PPR Tools",
+            "PPR",
+            "Unrelated",
+            "Paper",
+        ]
+        .into_iter()
+        .map(|name| {
+            let mut snapshot = crate::model::test_snapshot();
+            snapshot.name = name.into();
+            snapshot
+        })
+        .collect();
+        assert_eq!(search(&all, "ppr"), [3, 2, 1, 0, 5]);
+        assert_eq!(search(&all, "  "), [0, 1, 2, 3, 4, 5]);
+        assert!(search(&all, "rpz").is_empty());
+        assert!(SnapshotQuery::new("pprj").resolve(&all).is_err());
     }
 }

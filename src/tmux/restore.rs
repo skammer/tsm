@@ -1,6 +1,7 @@
 use super::{
     client::{current_pane, field, format_literal, run},
     command::restore_command,
+    launch::Launch,
 };
 use crate::model::{Scope, Snapshot, WindowSnapshot};
 use anyhow::{Context, Result, bail, ensure};
@@ -23,13 +24,6 @@ impl Transaction {
             })
             .collect()
     }
-}
-
-struct Launch {
-    pane: String,
-    cwd: String,
-    command: Option<String>,
-    title: String,
 }
 
 pub fn restore(snapshot: &Snapshot) -> Result<Vec<String>> {
@@ -99,12 +93,13 @@ fn restore_inner(snapshot: &Snapshot, tx: &mut Transaction) -> Result<Vec<String
                 "-F",
                 "#{session_id} #{window_id}",
                 "-s",
-                &name,
+                &format_literal(&name),
                 "-n",
-                &session.windows[0].name,
+                &format_literal(&session.windows[0].name),
                 "-c",
                 &format_literal(&session.windows[0].panes[0].cwd),
-                "exec /bin/sh",
+                "/bin/sleep",
+                "86400",
             ])?;
             let (id, window) = value
                 .split_once(' ')
@@ -140,33 +135,8 @@ fn restore_inner(snapshot: &Snapshot, tx: &mut Transaction) -> Result<Vec<String
             run(&["select-window", "-t", &window_ids[session.active_window]])?;
         }
     }
-    // Build every layout before starting programs. Retain fast-exiting panes.
     for launch in launches {
-        let command = match &launch.command {
-            Some(command) => command.clone(),
-            None => {
-                let shell = run(&[
-                    "show-options",
-                    "-A",
-                    "-v",
-                    "-t",
-                    &launch.pane,
-                    "default-shell",
-                ])?;
-                ensure!(!shell.is_empty(), "tmux default-shell is empty");
-                format!("exec {}", shell_words::quote(&shell))
-            }
-        };
-        let mut args = vec!["respawn-pane", "-k", "-t", &launch.pane, "-c", &launch.cwd];
-        args.push(&command);
-        run(&args)?;
-        run(&[
-            "select-pane",
-            "-t",
-            &launch.pane,
-            "-T",
-            &format_literal(&launch.title),
-        ])?;
+        launch.start()?;
     }
     for (window, pane, zoomed) in focuses {
         run(&["select-pane", "-t", &pane])?;
@@ -191,10 +161,11 @@ fn create_window(session: &str, window: &WindowSnapshot, index: Option<usize>) -
         "-t",
         &target,
         "-n",
-        &window.name,
+        &format_literal(&window.name),
         "-c",
         &format_literal(&window.panes[0].cwd),
-        "exec /bin/sh",
+        "/bin/sleep",
+        "86400",
     ])
 }
 
@@ -202,7 +173,6 @@ fn prepare_window(id: &str, window: &WindowSnapshot, launches: &mut Vec<Launch>)
     let (width, height) = dimensions(&window.layout)?;
     run(&["set-option", "-w", "-t", id, "automatic-rename", "off"])?;
     run(&["set-option", "-w", "-t", id, "allow-rename", "off"])?;
-    run(&["set-option", "-w", "-t", id, "remain-on-exit", "on"])?;
     run(&["set-option", "-w", "-t", id, "window-size", "manual"])?;
     run(&[
         "resize-window",
@@ -241,7 +211,7 @@ fn prepare_window(id: &str, window: &WindowSnapshot, launches: &mut Vec<Launch>)
     for (id, pane) in ids.iter().zip(&window.panes) {
         launches.push(Launch {
             pane: id.clone(),
-            cwd: format_literal(&pane.cwd),
+            cwd: pane.cwd.clone(),
             command: restore_command(pane)?,
             title: pane.title.clone(),
         });

@@ -26,6 +26,8 @@ impl Server {
                 .arg(self.socket())
                 .args(["-f", "/dev/null"])
                 .args(args)
+                .env("HOME", self.dir.path())
+                .env("SHELL", "/bin/sh")
                 .env_remove("TMUX")
                 .env_remove("TMUX_PANE")
                 .output()
@@ -99,6 +101,110 @@ fn rewrite_snapshot(server: &Server, snapshot: &Value) {
         .join("store")
         .join(format!("{}.json", snapshot["id"].as_str().unwrap()));
     fs::write(path, serde_json::to_vec(snapshot).unwrap()).unwrap();
+}
+
+#[test]
+#[ignore = "starts a dedicated tmux server; needs process inspection permissions"]
+fn restored_programs_leave_a_working_shell_in_the_same_pane() {
+    let server = Server::new();
+    let cwd = server.dir.path().join("work #{session_name}");
+    fs::create_dir(&cwd).unwrap();
+    let cwd = cwd.to_str().unwrap();
+    let initial = server.tmux(&[
+        "new-session",
+        "-d",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "-s",
+        "source",
+        "/bin/sleep",
+        "120",
+    ]);
+    let saved = server.tsm(
+        &["save", "window", "-n", "Replay #{session_name}"],
+        Some(&initial),
+    );
+    let id = saved_id(&saved);
+    let mut snapshot = server.snapshot(id);
+    snapshot["sessions"][0]["windows"][0]["name"] = "Window #{session_name}".into();
+    let home = server.dir.path().to_str().unwrap();
+    server.tmux(&["set-environment", "-g", "ZDOTDIR", home]);
+    fs::write(server.dir.path().join(".zshrc"), "PROMPT='tsm-test> '\n").unwrap();
+
+    for (shell, exit_key) in [
+        ("/bin/sh", "Enter"),
+        ("/bin/bash", "C-c"),
+        ("/bin/zsh", "Enter"),
+    ] {
+        if !std::path::Path::new(shell).is_file() {
+            continue;
+        }
+        server.tmux(&["set-option", "-g", "default-shell", shell]);
+        let pane = &mut snapshot["sessions"][0]["windows"][0]["panes"][0];
+        pane["cwd"] = cwd.into();
+        pane["title"] = "Pane #{session_name}".into();
+        let arg = "a b;$(no)'\nline\t";
+        pane["argv"] = serde_json::json!([
+            "/bin/sh",
+            "-c",
+            "test \"$1\" = \"$2\" && test -z \"${TSM_RESTORE_COMMAND+x}\" || exit 3; pwd; printf 'APP_WAITING\\n'; read -r answer; exit 7",
+            "replayed-app",
+            arg,
+            arg,
+        ]);
+        rewrite_snapshot(&server, &snapshot);
+        let restored = server.tsm(&["restore", id], None);
+        let session = restored.split_once(": ").unwrap().1;
+        assert!(session.starts_with("Replay #{session_name}"));
+        let pane = server.tmux(&["list-panes", "-t", session, "-F", "#{pane_id}"]);
+        assert_eq!(
+            server.tmux(&[
+                "display-message",
+                "-p",
+                "-t",
+                &pane,
+                "#{window_name}:#{pane_title}"
+            ]),
+            "Window #{session_name}:Pane #{session_name}",
+        );
+        let before = server.tmux(&["display-message", "-p", "-t", &pane, "#{pane_pid}"]);
+        let screen = wait_screen(&server, &pane, "APP_WAITING");
+        assert!(screen.contains("work #{session_name}"), "{screen}");
+        server.tmux(&["send-keys", "-t", &pane, exit_key]);
+        wait_screen(
+            &server,
+            &pane,
+            if shell == "/bin/zsh" {
+                "tsm-test>"
+            } else {
+                "$"
+            },
+        );
+        server.tmux(&[
+            "send-keys",
+            "-t",
+            &pane,
+            "-l",
+            "printf 'SHELL_%s\\n' ALIVE; pwd",
+        ]);
+        server.tmux(&["send-keys", "-t", &pane, "Enter"]);
+        let screen = wait_screen(&server, &pane, "SHELL_ALIVE");
+        assert!(
+            screen.matches("work #{session_name}").count() >= 2,
+            "{screen}"
+        );
+        assert_eq!(
+            server.tmux(&[
+                "display-message",
+                "-p",
+                "-t",
+                &pane,
+                "#{pane_pid}:#{pane_dead}"
+            ]),
+            format!("{before}:0"),
+        );
+    }
 }
 
 #[test]
@@ -666,8 +772,8 @@ fn all_scopes_commands_layouts_queries_and_rollback() {
     ]);
     server.tmux(&["resize-window", "-t", &tui, "-x", "120", "-y", "24"]);
     wait_screen(&server, &tui, "Saved snapshots");
-    server.tmux(&["send-keys", "-t", &tui, "/Pers", "Enter"]);
-    wait_screen(&server, &tui, "Personal projects");
+    server.tmux(&["send-keys", "-t", &tui, "/Pprj", "Enter"]);
+    wait_screen(&server, &tui, "› Personal projects");
     server.tmux(&[
         "send-keys",
         "-t",
@@ -682,7 +788,7 @@ fn all_scopes_commands_layouts_queries_and_rollback() {
     server.tmux(&["send-keys", "-t", &tui, "r"]);
     wait_screen(&server, &tui, "Restored:");
     server.tmux(&["send-keys", "-t", &tui, "w", "TUI snapshot", "Enter"]);
-    let screen = wait_screen(&server, &tui, "· TUI snapshot");
+    let screen = wait_screen(&server, &tui, "Saved: ");
     println!("TUI verified:\n{screen}");
     assert!(
         server
@@ -690,20 +796,27 @@ fn all_scopes_commands_layouts_queries_and_rollback() {
             .contains("tsm-ui")
     );
     server.tmux(&["send-keys", "-t", &tui, "/"]);
-    // Clear the previous filter through the TUI's supported editing keys.
-    server.tmux(&[
-        "send-keys",
-        "-t",
-        &tui,
-        "BSpace",
-        "BSpace",
-        "BSpace",
-        "BSpace",
-        "TUI snapshot",
-        "Enter",
-    ]);
+    server.tmux(&["send-keys", "-t", &tui, "C-u", "TUI snapshot", "Enter"]);
     let screen = wait_screen(&server, &tui, "tsm-ui");
     assert!(!screen.contains("Layout:"));
+    server.tmux(&["send-keys", "-t", &tui, "/", "C-u", "missing filter"]);
+    wait_screen(&server, &tui, "No matches.");
+    server.tmux(&["send-keys", "-t", &tui, "Escape"]);
+    wait_screen(&server, &tui, "tsm-ui");
+    server.tmux(&["resize-window", "-t", &tui, "-x", "44", "-y", "12"]);
+    let compact = wait_screen(&server, &tui, "Tab inspect");
+    assert!(!compact.contains("Inspector"));
+    server.tmux(&["send-keys", "-t", &tui, "Enter"]);
+    let compact = wait_screen(&server, &tui, "tsm-ui");
+    assert!(compact.contains("Inspector"));
+    println!("Compact TUI verified:\n{compact}");
+    server.tmux(&["send-keys", "-t", &tui, "?"]);
+    wait_screen(&server, &tui, "Keyboard shortcuts");
+    server.tmux(&["send-keys", "-t", &tui, "End"]);
+    wait_screen(&server, &tui, "broken.json");
+    server.tmux(&["send-keys", "-t", &tui, "Escape"]);
+    wait_screen(&server, &tui, "Inspector");
+    server.tmux(&["resize-window", "-t", &tui, "-x", "120", "-y", "24"]);
     server.tmux(&["send-keys", "-t", &tui, "i"]);
     wait_screen(&server, &tui, "Layout:");
     server.tmux(&["send-keys", "-t", &tui, "i", "d"]);

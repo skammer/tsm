@@ -1,7 +1,12 @@
 use crate::{model::Snapshot, query::SnapshotQuery};
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
-use std::{cmp::Reverse, env, fs, io::Write, path::PathBuf};
+use std::{
+    cmp::Reverse,
+    env, fs,
+    io::{ErrorKind, Write},
+    path::PathBuf,
+};
 
 pub struct Store {
     dir: PathBuf,
@@ -70,10 +75,14 @@ impl Store {
             snapshots: vec![],
             warnings: vec![],
         };
-        if !self.dir.exists() {
-            return Ok(catalog);
-        }
-        for entry in fs::read_dir(&self.dir)? {
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(catalog),
+            Err(error) => {
+                return Err(error).with_context(|| format!("read {}", self.dir.display()));
+            }
+        };
+        for entry in entries {
             let path = entry?.path();
             if path.extension().and_then(|value| value.to_str()) != Some("json") {
                 continue;

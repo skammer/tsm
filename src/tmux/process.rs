@@ -114,6 +114,9 @@ fn process_exists(pid: u32) -> bool {
 #[cfg(target_os = "linux")]
 fn argv(pid: u32) -> Result<Vec<String>> {
     let bytes = std::fs::read(format!("/proc/{pid}/cmdline"))?;
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
     bytes
         .strip_suffix(&[0])
         .unwrap_or(&bytes)
