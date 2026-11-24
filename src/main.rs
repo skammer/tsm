@@ -11,7 +11,7 @@ use clap::Parser;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    if let Some(result) = tmux::run_pane_replay() {
+    if let Some(result) = tmux::run_pane_helper() {
         return match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {

@@ -5,7 +5,7 @@ use super::{
 };
 use crate::model::{Scope, Snapshot, WindowSnapshot};
 use anyhow::{Context, Result, bail, ensure};
-use std::path::Path;
+use std::{env, path::Path};
 
 pub struct RestorePlan {
     panes: Vec<RestorePane>,
@@ -135,8 +135,20 @@ pub fn execute_restore(
     progress("Checking restore destination".into());
     check_directories(&plan.panes)?;
     plan.target.check(&plan.snapshot)?;
+    let executable = env::current_exe()
+        .and_then(|path| path.canonicalize())
+        .context("resolve tsm executable for pane launch")?;
+    let executable = executable.to_str().context("tsm executable is not UTF-8")?;
+    let mut launches = plan
+        .panes
+        .iter()
+        .map(|pane| Launch::new(executable, &pane.cwd, pane.replay.as_ref()))
+        .collect::<Result<Vec<_>>>()?;
+
+    // Keep the launch sockets alive through rollback so waiting panes are
+    // removed by tmux along with their windows or sessions.
     let mut transaction = Transaction::default();
-    let result = restore_inner(&plan, &mut transaction, &mut progress);
+    let result = restore_inner(&plan, &mut launches, &mut transaction, &mut progress);
     if let Err(error) = result {
         let failures = transaction.rollback();
         if failures.is_empty() {
@@ -163,48 +175,48 @@ fn check_directories(panes: &[RestorePane]) -> Result<()> {
 
 fn restore_inner(
     plan: &RestorePlan,
+    launches: &mut [Launch<'_>],
     tx: &mut Transaction,
     progress: &mut impl FnMut(String),
 ) -> Result<RestoreReport> {
     let snapshot = &plan.snapshot;
-    let mut launches = Vec::new();
     let mut restored = Vec::new();
     let mut focuses = Vec::new();
     let mut jump_target = None;
 
-    let mut panes = plan.panes.iter();
+    let mut pane_offset = 0;
     for (session_index, session) in snapshot.sessions.iter().enumerate() {
+        let first = &session.windows[0];
+        let first_launch = &launches[pane_offset];
         let (session_id, first_window, owns_session) = match &plan.target {
             Destination::CurrentSession { id, name } => {
-                let window = create_window(id, &session.windows[0], None)?;
+                let window = create_window(id, first, None, first_launch)?;
                 tx.created.push(("kill-window", window.clone()));
-                restored.push(format!("window {} in {name}", session.windows[0].name));
+                restored.push(format!("window {} in {name}", first.name));
                 (id.clone(), window, false)
             }
             Destination::NewSessions(names) => {
                 let name = &names[session_index];
                 progress(format!("Creating session {name}"));
-                let value = run(&[
+                let mut args = vec![
                     "new-session",
                     "-d",
                     "-P",
                     "-F",
                     "#{session_id} #{window_id}",
                     "-s",
-                    &format_literal(name),
-                    "-n",
-                    &format_literal(&session.windows[0].name),
-                    "-c",
-                    &format_literal(&session.windows[0].panes[0].cwd),
-                    "/bin/sleep",
-                    "86400",
-                ])?;
+                ];
+                let session_name = format_literal(name);
+                let window_name = format_literal(&first.name);
+                args.extend([&session_name, "-n", &window_name]);
+                args.extend(first_launch.args());
+                let value = run(&args)?;
                 let (id, window) = value
                     .split_once(' ')
                     .context("invalid new-session result")?;
                 tx.created.push(("kill-session", id.into()));
                 run(&["set-option", "-t", id, "renumber-windows", "off"])?;
-                let first_index = session.windows[0].index.to_string();
+                let first_index = first.index.to_string();
                 if field(window, "window_index")? != first_index {
                     run(&[
                         "move-window",
@@ -225,29 +237,27 @@ fn restore_inner(
                 RestoredTarget::Window(format!("{session_id}:{first_window}"))
             }
         });
-        let mut window_ids = vec![first_window];
-        for window in session.windows.iter().skip(1) {
-            let id = create_window(&session_id, window, Some(window.index))?;
-            if !owns_session {
-                tx.created.push(("kill-window", id.clone()));
-            }
-            window_ids.push(id);
-        }
-        for (id, window) in window_ids.iter().zip(&session.windows) {
+        let mut window_ids = Vec::new();
+        for (index, window) in session.windows.iter().enumerate() {
+            let id = if index == 0 {
+                first_window.clone()
+            } else {
+                create_window(
+                    &session_id,
+                    window,
+                    Some(window.index),
+                    &launches[pane_offset],
+                )?
+            };
+            let range = pane_offset..pane_offset + window.panes.len();
+            pane_offset = range.end;
             progress(format!("Rebuilding window {}", window.name));
-            let ids = prepare_window(id, window)?;
+            let ids = prepare_window(&id, window, &launches[range.clone()])?;
             focuses.push((id.clone(), ids[window.active_pane].clone(), window.zoomed));
-            launches.extend(ids.into_iter().zip(&mut panes).map(|(id, pane)| {
-                (
-                    &pane.label,
-                    Launch {
-                        pane: id,
-                        cwd: &pane.cwd,
-                        command: pane.replay.as_ref(),
-                        title: &pane.title,
-                    },
-                )
-            }));
+            window_ids.push(id);
+            for (id, pane) in ids.iter().zip(&plan.panes[range]) {
+                run(&["select-pane", "-t", id, "-T", &format_literal(&pane.title)])?;
+            }
         }
         if owns_session {
             run(&["select-window", "-t", &window_ids[session.active_window]])?;
@@ -255,9 +265,10 @@ fn restore_inner(
     }
     let mut startups = Vec::new();
     let count = launches.len();
-    for (index, (label, launch)) in launches.into_iter().enumerate() {
+    for (index, (pane, launch)) in plan.panes.iter().zip(launches).enumerate() {
+        let label = &pane.label;
         progress(format!("Starting pane {} of {count} · {label}", index + 1));
-        if let Some(startup) = launch.start()? {
+        if let Some(startup) = launch.start().with_context(|| label.clone())? {
             startups.push((label, startup));
         }
     }
@@ -285,11 +296,17 @@ fn restore_inner(
     })
 }
 
-fn create_window(session: &str, window: &WindowSnapshot, index: Option<usize>) -> Result<String> {
+fn create_window(
+    session: &str,
+    window: &WindowSnapshot,
+    index: Option<usize>,
+    launch: &Launch<'_>,
+) -> Result<String> {
     let target = index
         .map(|index| format!("{session}:{index}"))
         .unwrap_or_else(|| session.into());
-    run(&[
+    let name = format_literal(&window.name);
+    let mut args = vec![
         "new-window",
         "-d",
         "-P",
@@ -298,15 +315,17 @@ fn create_window(session: &str, window: &WindowSnapshot, index: Option<usize>) -
         "-t",
         &target,
         "-n",
-        &format_literal(&window.name),
-        "-c",
-        &format_literal(&window.panes[0].cwd),
-        "/bin/sleep",
-        "86400",
-    ])
+        &name,
+    ];
+    args.extend(launch.args());
+    run(&args)
 }
 
-fn prepare_window(id: &str, window: &WindowSnapshot) -> Result<Vec<String>> {
+fn prepare_window(
+    id: &str,
+    window: &WindowSnapshot,
+    launches: &[Launch<'_>],
+) -> Result<Vec<String>> {
     let (width, height) = dimensions(&window.layout)?;
     run(&["set-option", "-w", "-t", id, "automatic-rename", "off"])?;
     run(&["set-option", "-w", "-t", id, "allow-rename", "off"])?;
@@ -321,8 +340,8 @@ fn prepare_window(id: &str, window: &WindowSnapshot) -> Result<Vec<String>> {
         &height.max(window.panes.len() * 4).to_string(),
     ])?;
     let mut ids = vec![run(&["list-panes", "-t", id, "-F", "#{pane_id}"])?];
-    for _ in window.panes.iter().skip(1) {
-        let next = run(&[
+    for launch in launches.iter().skip(1) {
+        let mut args = vec![
             "split-window",
             "-d",
             "-P",
@@ -330,8 +349,9 @@ fn prepare_window(id: &str, window: &WindowSnapshot) -> Result<Vec<String>> {
             "#{pane_id}",
             "-t",
             ids.last().unwrap(),
-            "",
-        ])?;
+        ];
+        args.extend(launch.args());
+        let next = run(&args)?;
         ids.push(next);
         run(&["select-layout", "-t", id, "even-vertical"])?;
     }

@@ -263,6 +263,14 @@ fn restored_programs_leave_a_working_shell_in_the_same_pane() {
         "/bin/sleep",
         "120",
     ]);
+    for hook in ["after-new-session", "after-new-window"] {
+        server.tmux(&[
+            "set-hook",
+            "-g",
+            hook,
+            "set-option -Fp @tsm-test-birth-pid '#{pane_pid}'",
+        ]);
+    }
     let saved = server.tsm(
         &["save", "window", "-n", "Replay #{session_name}"],
         Some(&initial),
@@ -296,10 +304,20 @@ fn restored_programs_leave_a_working_shell_in_the_same_pane() {
             arg,
         ]);
         rewrite_snapshot(&server, &snapshot);
-        let restored = server.tsm(&["restore", id], None);
-        let session = restored.split_once(": ").unwrap().1;
-        assert!(session.starts_with("Replay #{session_name}"));
-        let pane = server.tmux(&["list-panes", "-t", session, "-F", "#{pane_id}"]);
+        let context = (shell == "/bin/zsh").then_some(initial.as_str());
+        let restored = server.tsm(&["restore", id], context);
+        let pane = if context.is_some() {
+            server.tmux(&["list-panes", "-t", "source:1", "-F", "#{pane_id}"])
+        } else {
+            let session = restored.split_once(": ").unwrap().1;
+            assert!(session.starts_with("Replay #{session_name}"));
+            server.tmux(&["list-panes", "-t", session, "-F", "#{pane_id}"])
+        };
+        let birth_pid = server.tmux(&["show-options", "-pv", "-t", &pane, "@tsm-test-birth-pid"]);
+        assert_eq!(
+            server.tmux(&["display-message", "-p", "-t", &pane, "#{pane_pid}"]),
+            birth_pid
+        );
         assert_eq!(
             server.tmux(&[
                 "display-message",
@@ -310,7 +328,6 @@ fn restored_programs_leave_a_working_shell_in_the_same_pane() {
             ]),
             "Window #{session_name}:Pane #{session_name}",
         );
-        let before = server.tmux(&["display-message", "-p", "-t", &pane, "#{pane_pid}"]);
         let screen = wait_screen(&server, &pane, "APP_WAITING");
         assert!(screen.contains("work #{session_name}"), "{screen}");
         server.tmux(&["send-keys", "-t", &pane, exit_key]);
@@ -344,7 +361,7 @@ fn restored_programs_leave_a_working_shell_in_the_same_pane() {
                 &pane,
                 "#{pane_pid}:#{pane_dead}"
             ]),
-            format!("{before}:0"),
+            format!("{birth_pid}:0"),
         );
     }
 }
@@ -878,10 +895,14 @@ fn all_scopes_commands_layouts_queries_and_rollback() {
 
     let before = server.tmux(&["list-sessions", "-F", "#{session_id}"]);
     let mut broken = snapshot.clone();
+    let marker = server.dir.path().join("started-before-layout");
+    broken["sessions"][0]["windows"][0]["panes"][0]["argv"] =
+        serde_json::json!(["/usr/bin/touch", marker]);
     broken["sessions"][0]["windows"][1]["layout"] = "ffff,80x24,0,0,0".into();
     rewrite_snapshot(&server, &broken);
     let failed = server.tsm_output(&["restore", id], None);
     assert!(!failed.status.success());
+    assert!(!marker.exists());
     assert!(String::from_utf8_lossy(&failed.stderr).contains("newly created tmux objects removed"));
     assert_eq!(
         server.tmux(&["list-sessions", "-F", "#{session_id}"]),

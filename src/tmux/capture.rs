@@ -1,5 +1,6 @@
 use super::{
     client::{current_pane, run},
+    launch::{is_launch_helper, is_launch_start_command},
     process::ProcessTable,
 };
 use crate::{
@@ -152,13 +153,22 @@ fn capture_window(
             active_pane = panes.len();
         }
         let pid = pid.parse().context("invalid pane PID")?;
+        if is_launch_start_command(&start_command) {
+            start_command.clear();
+        }
         // Use ancestry so aliases, renamed binaries and wrappers aren't replayed.
         let argv = if processes.foreground_is_current_call(pid) {
             command.clear();
             start_command.clear();
             Vec::new()
         } else {
-            processes.foreground_argv(pid)?
+            let argv = processes.foreground_argv(pid)?;
+            if is_launch_helper(&argv) {
+                command.clear();
+                Vec::new()
+            } else {
+                argv
+            }
         };
         panes.push(PaneSnapshot {
             title,

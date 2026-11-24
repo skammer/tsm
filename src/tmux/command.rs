@@ -1,7 +1,8 @@
 use crate::model::PaneSnapshot;
 use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum Replay {
     Arguments(Vec<String>),
     Script(String),
