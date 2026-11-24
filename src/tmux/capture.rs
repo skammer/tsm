@@ -1,102 +1,184 @@
 use super::{
-    client::{current_pane, field, run},
+    client::{current_pane, run},
     process::ProcessTable,
 };
-use crate::model::{PaneSnapshot, Scope, SessionSnapshot, Snapshot, WindowSnapshot};
-use anyhow::{Context, Result, bail, ensure};
+use crate::{
+    model::{PaneSnapshot, Scope, SessionSnapshot, Snapshot, WindowSnapshot},
+    query::pick_target,
+};
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use uuid::Uuid;
 
-/// A live tmux object (session or window) that a selector can refer to.
-struct Listed {
+const FIELD_SEPARATOR: char = '\x1f';
+
+struct SessionRow {
     id: String,
-    index: Option<usize>,
     name: String,
 }
 
-/// Resolve a selector against listed objects: numeric index first, then exact
-/// name, then a unique case-insensitive name prefix.
-fn pick(listed: &[Listed], selector: &str, kind: &str) -> Result<String> {
-    ensure!(!selector.is_empty(), "{kind} selector is empty");
-    if let Ok(index) = selector.parse::<usize>()
-        && let Some(item) = listed.iter().find(|item| item.index == Some(index))
-    {
-        return Ok(item.id.clone());
-    }
-    if let Some(item) = listed.iter().find(|item| item.name == selector) {
-        return Ok(item.id.clone());
-    }
-    let lower = selector.to_lowercase();
-    let prefixed: Vec<_> = listed
+struct WindowRow {
+    id: String,
+    index: usize,
+    name: String,
+    layout: String,
+    active: bool,
+    zoomed: bool,
+}
+
+fn row_format(fields: &[&str]) -> String {
+    fields
         .iter()
-        .filter(|item| item.name.to_lowercase().starts_with(&lower))
-        .collect();
-    match prefixed.as_slice() {
-        [item] => Ok(item.id.clone()),
-        [] => bail!("{kind} not found: {selector}"),
-        _ => bail!(
-            "ambiguous {kind} '{selector}', matches: {}",
-            prefixed
-                .iter()
-                .map(|item| item.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+        // Encode the percent sign before encoding record and field delimiters.
+        .map(|field| format!("#{{s|%|%25|;s|\n|%0A|;s|{FIELD_SEPARATOR}|%1F|:{field}}}"))
+        .collect::<Vec<_>>()
+        .join(&FIELD_SEPARATOR.to_string())
+}
+
+fn decode_field(value: &str) -> Result<String> {
+    let mut parts = value.split('%');
+    let mut decoded = parts.next().unwrap_or_default().to_owned();
+    for part in parts {
+        let (escape, rest) = part
+            .split_at_checked(2)
+            .context("truncated tmux field escape")?;
+        decoded.push(match escape {
+            "25" => '%',
+            "0A" => '\n',
+            "1F" => FIELD_SEPARATOR,
+            _ => bail!("invalid tmux field escape"),
+        });
+        decoded.push_str(rest);
     }
+    Ok(decoded)
 }
 
-fn resolve_session(selector: &str) -> Result<String> {
-    let listing = run(&["list-sessions", "-F", "#{session_id}\t#{session_name}"])?;
-    let listed: Vec<Listed> = listing
-        .lines()
-        .map(|line| {
-            let (id, name) = line.split_once('\t').unwrap_or((line, ""));
-            Listed {
-                id: id.to_owned(),
-                index: None,
-                name: name.to_owned(),
-            }
+fn rows<const N: usize>(output: &str) -> impl Iterator<Item = Result<[String; N]>> + '_ {
+    output.split_terminator('\n').map(|line| {
+        line.split(FIELD_SEPARATOR)
+            .map(decode_field)
+            .collect::<Result<Vec<_>>>()?
+            .try_into()
+            .ok()
+            .context("unexpected number of fields in tmux output")
+    })
+}
+
+fn list_sessions() -> Result<Vec<SessionRow>> {
+    let format = row_format(&["session_id", "session_name"]);
+    let output = run(&["list-sessions", "-F", &format])?;
+    rows(&output)
+        .map(|row| row.map(|[id, name]| SessionRow { id, name }))
+        .collect()
+}
+
+fn list_windows(session: &str) -> Result<Vec<WindowRow>> {
+    let format = row_format(&[
+        "window_id",
+        "window_index",
+        "window_name",
+        "window_layout",
+        "window_active",
+        "window_zoomed_flag",
+    ]);
+    let output = run(&["list-windows", "-t", session, "-F", &format])?;
+    rows(&output)
+        .map(|row| {
+            let [id, index, name, layout, active, zoomed] = row?;
+            Ok(WindowRow {
+                id,
+                index: index.parse().context("invalid tmux window index")?,
+                name,
+                layout,
+                active: active == "1",
+                zoomed: zoomed == "1",
+            })
         })
-        .collect();
-    pick(&listed, selector, "session")
+        .collect()
 }
 
-/// Resolve `[session:]window` into `(session_id, window_id)`.
-/// Without a session part the current pane's session is used.
-fn resolve_window(selector: &str) -> Result<(String, String)> {
-    let (session_selector, window_selector) = match selector.split_once(':') {
-        Some((session, window)) => (Some(session), window),
-        None => (None, selector),
-    };
-    let session = match session_selector {
-        Some(selector) => resolve_session(selector)?,
-        None => field(&current_pane()?, "session_id")?,
-    };
-    let listing = run(&[
-        "list-windows",
-        "-t",
-        &session,
-        "-F",
-        "#{window_id}\t#{window_index}\t#{window_name}",
-    ])?;
-    let listed: Vec<Listed> = listing
-        .lines()
-        .map(|line| {
-            let mut parts = line.splitn(3, '\t');
-            Listed {
-                id: parts.next().unwrap_or_default().to_owned(),
-                index: parts.next().and_then(|index| index.parse().ok()),
-                name: parts.next().unwrap_or_default().to_owned(),
-            }
-        })
-        .collect();
-    let window = pick(&listed, window_selector, "window")?;
-    Ok((session, window))
+fn target_for_pane(pane: &str) -> Result<(SessionRow, String)> {
+    let format = row_format(&["session_id", "session_name", "window_id"]);
+    let output = run(&["display-message", "-p", "-t", pane, &format])?;
+    let [id, name, window] = rows(&output).next().context("no tmux session for pane")??;
+    Ok((SessionRow { id, name }, window))
 }
 
-enum Windows {
-    All,
-    One(String),
+fn select_session(selector: &str) -> Result<SessionRow> {
+    pick_target(
+        selector,
+        "session",
+        list_sessions()?,
+        |session| (None, session.name.as_str()),
+        |session| session.name.clone(),
+    )
+}
+
+fn select_window(
+    session: &SessionRow,
+    selector: &str,
+    windows: Vec<WindowRow>,
+) -> Result<WindowRow> {
+    pick_target(
+        selector,
+        "window",
+        windows,
+        |window| (Some(window.index), window.name.as_str()),
+        |window| format!("{}:{} ({})", session.name, window.index, window.name),
+    )
+}
+
+fn capture_window(
+    session: &SessionRow,
+    window: WindowRow,
+    processes: &ProcessTable,
+) -> Result<WindowSnapshot> {
+    let target = format!("{}:{}", session.id, window.id);
+    let format = row_format(&[
+        "pane_active",
+        "pane_pid",
+        "pane_title",
+        "pane_current_path",
+        "pane_current_command",
+        "pane_start_command",
+    ]);
+    let output = run(&["list-panes", "-t", &target, "-F", &format])?;
+    let mut active_pane = 0;
+    let mut panes = Vec::new();
+    for row in rows(&output) {
+        let [active, pid, title, cwd, mut command, mut start_command] = row?;
+        let active = active == "1";
+        if active {
+            active_pane = panes.len();
+        }
+        let pid = pid.parse().context("invalid pane PID")?;
+        // Use ancestry so aliases, renamed binaries and wrappers aren't replayed.
+        let argv = if processes.foreground_is_current_call(pid) {
+            command.clear();
+            start_command.clear();
+            Vec::new()
+        } else {
+            processes.foreground_argv(pid)?
+        };
+        panes.push(PaneSnapshot {
+            title,
+            cwd,
+            command,
+            command_line: shell_words::join(&argv),
+            argv,
+            start_command,
+            active,
+        });
+    }
+
+    Ok(WindowSnapshot {
+        index: window.index,
+        name: window.name,
+        layout: window.layout,
+        panes,
+        active_pane,
+        zoomed: window.zoomed,
+    })
 }
 
 pub fn capture(
@@ -104,108 +186,68 @@ pub fn capture(
     target: Option<&str>,
     custom_name: Option<String>,
 ) -> Result<Snapshot> {
-    let plan: Vec<(String, Windows)> = match (&scope, target) {
+    let plan = match (&scope, target) {
         (Scope::All, Some(_)) => bail!("a target is not valid for scope 'all'"),
-        (Scope::All, None) => run(&["list-sessions", "-F", "#{session_id}"])?
-            .lines()
-            .map(|session| (session.to_owned(), Windows::All))
-            .collect(),
-        (Scope::Session, None) => {
-            let pane = current_pane()?;
-            vec![(field(&pane, "session_id")?, Windows::All)]
-        }
-        (Scope::Session, Some(selector)) => vec![(resolve_session(selector)?, Windows::All)],
-        (Scope::Window, None) => {
-            let pane = current_pane()?;
-            vec![(
-                field(&pane, "session_id")?,
-                Windows::One(field(&pane, "window_id")?),
-            )]
+        (Scope::All, None) => list_sessions()?
+            .into_iter()
+            .map(|session| {
+                let windows = list_windows(&session.id)?;
+                Ok((session, windows))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        (Scope::Session, target) => {
+            let session = match target {
+                Some(selector) => select_session(selector)?,
+                None => target_for_pane(&current_pane()?)?.0,
+            };
+            let windows = list_windows(&session.id)?;
+            vec![(session, windows)]
         }
         (Scope::Window, Some(selector)) => {
-            let (session, window) = resolve_window(selector)?;
-            vec![(session, Windows::One(window))]
+            let (session, window) = match selector.split_once(':') {
+                Some((session, window)) => (select_session(session)?, window),
+                None => (target_for_pane(&current_pane()?)?.0, selector),
+            };
+            let windows = list_windows(&session.id)?;
+            let selected = select_window(&session, window, windows)?;
+            vec![(session, vec![selected])]
+        }
+        (Scope::Window, None) => {
+            let (session, id) = target_for_pane(&current_pane()?)?;
+            let window = list_windows(&session.id)?
+                .into_iter()
+                .find(|window| window.id == id)
+                .context("window disappeared during capture")?;
+            vec![(session, vec![window])]
         }
     };
+
     let processes = ProcessTable::load()?;
-    let mut saved_sessions = Vec::new();
-    for (session, filter) in plan {
-        let name = field(&session, "session_name")?;
-        let windows: Vec<String> = match &filter {
-            Windows::One(window) => vec![window.clone()],
-            Windows::All => run(&["list-windows", "-t", &session, "-F", "#{window_id}"])?
-                .lines()
-                .map(str::to_owned)
-                .collect(),
-        };
-        let mut saved_windows = Vec::new();
-        let mut active_window = 0;
-        for window in windows {
-            let target = format!("{session}:{window}");
-            if field(&target, "window_active")? == "1" {
-                active_window = saved_windows.len();
-            }
-            let pane_ids = run(&["list-panes", "-t", &target, "-F", "#{pane_id}"])?;
-            let mut panes = Vec::new();
-            let mut active_pane = 0;
-            for pane in pane_ids.lines() {
-                let active = field(pane, "pane_active")? == "1";
-                if active {
-                    active_pane = panes.len();
-                }
-                let pid = field(pane, "pane_pid")?
-                    .parse()
-                    .context("invalid pane PID")?;
-                // Identify this invocation by PID/ancestry, not executable name:
-                // aliases, renamed binaries and shell wrappers must not replay.
-                let current_call = processes.foreground_is_current_call(pid);
-                let argv = if current_call {
-                    vec![]
-                } else {
-                    processes.foreground_argv(pid)?
-                };
-                panes.push(PaneSnapshot {
-                    title: field(pane, "pane_title")?,
-                    cwd: field(pane, "pane_current_path")?,
-                    command: if current_call {
-                        String::new()
-                    } else {
-                        field(pane, "pane_current_command")?
-                    },
-                    command_line: shell_words::join(&argv),
-                    argv,
-                    start_command: if current_call {
-                        String::new()
-                    } else {
-                        field(pane, "pane_start_command")?
-                    },
-                    active,
-                });
-            }
-            saved_windows.push(WindowSnapshot {
-                index: field(&target, "window_index")?.parse()?,
-                name: field(&target, "window_name")?,
-                layout: field(&target, "window_layout")?,
-                zoomed: field(&target, "window_zoomed_flag")? == "1",
-                panes,
-                active_pane,
-            });
-        }
-        saved_sessions.push(SessionSnapshot {
-            name,
-            windows: saved_windows,
-            active_window,
-        });
-    }
+    let sessions = plan
+        .into_iter()
+        .map(|(session, windows)| {
+            let active_window = windows.iter().position(|window| window.active).unwrap_or(0);
+            let windows = windows
+                .into_iter()
+                .map(|window| capture_window(&session, window, &processes))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(SessionSnapshot {
+                name: session.name,
+                windows,
+                active_window,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     let default_name = match scope {
-        Scope::Window => saved_sessions
+        Scope::Window => sessions
             .first()
-            .and_then(|s| s.windows.first())
-            .map(|w| w.name.clone())
+            .and_then(|session| session.windows.first())
+            .map(|window| window.name.clone())
             .unwrap_or_default(),
-        Scope::Session => saved_sessions
+        Scope::Session => sessions
             .first()
-            .map(|s| s.name.clone())
+            .map(|session| session.name.clone())
             .unwrap_or_default(),
         Scope::All => format!("All sessions {}", Utc::now().format("%Y-%m-%d %H:%M")),
     };
@@ -215,8 +257,23 @@ pub fn capture(
         name: custom_name.unwrap_or(default_name),
         created_at: Utc::now(),
         scope,
-        sessions: saved_sessions,
+        sessions,
     };
     snapshot.validate()?;
     Ok(snapshot)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_rows_preserve_control_characters_and_literal_escapes() {
+        let output =
+            format!("two%1Ffields{FIELD_SEPARATOR}%250A%0A tab\t\r\\字\n{FIELD_SEPARATOR}");
+        let batches = rows::<2>(&output).collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(batches[0], ["two\x1ffields", "%0A\n tab\t\r\\字"]);
+        assert_eq!(batches[1], ["", ""]);
+        assert!(rows::<2>("incomplete").next().unwrap().is_err());
+    }
 }

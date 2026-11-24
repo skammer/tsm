@@ -1,12 +1,12 @@
 use crate::{
     color::{ColorMode, Colors},
     merge,
-    model::{Scope, Snapshot, WindowSnapshot},
-    query::{search, short_id},
-    store::Store,
+    model::{Scope, Snapshot},
+    query::{pick_target, search, short_id},
+    store::{Catalog, Store},
     tmux, tui,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
@@ -43,7 +43,7 @@ enum Commands {
     /// Inspect by exact name, UUID, or unique UUID prefix
     Inspect {
         snapshot: String,
-        /// Show only this window: index, name, or unique name prefix
+        /// Show one [session:]window by index, name, or unique name prefix
         window: Option<String>,
     },
     /// Restore latest snapshot (default), or select by name/UUID
@@ -147,12 +147,38 @@ pub fn run(cli: Cli) -> Result<()> {
             print_saved(&snapshot, &catalog.snapshots, colors);
             Ok(())
         }
+        Some(Commands::Merge {
+            snapshots,
+            into,
+            name,
+        }) => {
+            let store = Store::discover()?;
+            let change = |catalog: &Catalog| {
+                print_warnings(catalog, errors);
+                let sources = snapshots
+                    .iter()
+                    .map(|query| catalog.resolve(query))
+                    .collect::<Result<Vec<_>>>()?;
+                let target = into
+                    .as_deref()
+                    .map(|query| catalog.resolve(query))
+                    .transpose()?;
+                merge::merge(&sources, target, name)
+            };
+            let (snapshot, catalog) = if into.is_some() {
+                store.update(change)?
+            } else {
+                let snapshot = change(&store.load()?)?;
+                store.save(&snapshot)?;
+                (snapshot, store.load()?)
+            };
+            print_saved(&snapshot, &catalog.snapshots, colors);
+            Ok(())
+        }
         Some(command) => {
             let store = Store::discover()?;
             let catalog = store.load()?;
-            for warning in &catalog.warnings {
-                eprintln!("{} {warning}", errors.paint("33", "warning:"));
-            }
+            print_warnings(&catalog, errors);
             match command {
                 Commands::List { filter } => {
                     println!(
@@ -187,11 +213,23 @@ pub fn run(cli: Cli) -> Result<()> {
                         Some(query) => catalog.resolve(&query)?,
                         None => catalog.latest()?,
                     };
+                    let plan = tmux::plan_restore(snapshot)?;
+                    let report = tmux::execute_restore(plan, |_| {})?;
+                    let status = if report.failures.is_empty() {
+                        colors.paint("32", "restored")
+                    } else {
+                        colors.paint("33", "created layout")
+                    };
                     println!(
                         "{} {}: {}",
-                        colors.paint("32", "restored"),
+                        status,
                         colors.paint("36", short_id(snapshot, &catalog.snapshots)),
-                        tmux::restore(snapshot)?.join(", ")
+                        report.targets.join(", ")
+                    );
+                    anyhow::ensure!(
+                        report.failures.is_empty(),
+                        "program startup issues:\n{}",
+                        report.failures.join("\n")
                     );
                 }
                 Commands::Delete { snapshot } => {
@@ -204,32 +242,18 @@ pub fn run(cli: Cli) -> Result<()> {
                         snapshot.name
                     );
                 }
-                Commands::Merge {
-                    snapshots,
-                    into,
-                    name,
-                } => {
-                    let sources = snapshots
-                        .iter()
-                        .map(|query| catalog.resolve(query))
-                        .collect::<Result<Vec<_>>>()?;
-                    let target = into
-                        .as_deref()
-                        .map(|query| catalog.resolve(query))
-                        .transpose()?;
-                    let snapshot = merge::merge(&sources, target, name)?;
-                    if target.is_some() {
-                        store.replace(&snapshot)?;
-                    } else {
-                        store.save(&snapshot)?;
-                    }
-                    let catalog = store.load()?;
-                    print_saved(&snapshot, &catalog.snapshots, colors);
+                Commands::Save { .. } | Commands::Peek(_) | Commands::Merge { .. } => {
+                    unreachable!()
                 }
-                Commands::Save { .. } | Commands::Peek(_) => unreachable!(),
             }
             Ok(())
         }
+    }
+}
+
+fn print_warnings(catalog: &Catalog, colors: Colors) {
+    for warning in &catalog.warnings {
+        eprintln!("{} {warning}", colors.paint("33", "warning:"));
     }
 }
 
@@ -242,16 +266,54 @@ fn print_saved(snapshot: &Snapshot, all: &[Snapshot], colors: Colors) {
     );
 }
 
-fn window_matches(selector: &str, window: &WindowSnapshot) -> bool {
-    selector.parse::<usize>().ok() == Some(window.index)
-        || window.name == selector
-        || window
-            .name
-            .to_lowercase()
-            .starts_with(&selector.to_lowercase())
+fn select_snapshot_window(snapshot: &Snapshot, selector: &str) -> Result<(usize, usize)> {
+    let sessions = snapshot.sessions.iter().enumerate();
+    let qualification = selector.split_once(':').filter(|_| {
+        // A literal window name containing a colon remains selectable.
+        let folded = selector.to_lowercase();
+        !snapshot
+            .sessions
+            .iter()
+            .flat_map(|session| &session.windows)
+            .any(|window| window.name.to_lowercase() == folded)
+    });
+    let (session_filter, selector) = match qualification {
+        Some((session, window)) => {
+            let (index, _) = pick_target(
+                session,
+                "session",
+                sessions.clone(),
+                |(_, session)| (None, session.name.as_str()),
+                |(_, session)| session.name.clone(),
+            )?;
+            (Some(index), window)
+        }
+        _ => (None, selector),
+    };
+    let candidates = sessions
+        .filter(|(index, _)| session_filter.is_none_or(|filter| *index == filter))
+        .flat_map(|(si, session)| {
+            session
+                .windows
+                .iter()
+                .enumerate()
+                .map(move |(wi, window)| (si, wi, session, window))
+        });
+    let (session, window, _, _) = pick_target(
+        selector,
+        "window",
+        candidates,
+        |(_, _, _, window)| (Some(window.index), window.name.as_str()),
+        |(_, _, session, window)| format!("{}:{} ({})", session.name, window.index, window.name),
+    )
+    .with_context(|| format!("inspect snapshot '{}'", snapshot.name))?;
+    Ok((session, window))
 }
 
 fn describe(snapshot: &Snapshot, window: Option<&str>, colors: Colors) -> Result<String> {
+    let selection = window
+        .map(|selector| select_snapshot_window(snapshot, selector))
+        .transpose()?;
     let mut lines = vec![
         format!(
             "{}  {}",
@@ -267,20 +329,18 @@ fn describe(snapshot: &Snapshot, window: Option<&str>, colors: Colors) -> Result
             ),
         ),
     ];
-    let mut matched = false;
-    for session in &snapshot.sessions {
-        let windows: Vec<_> = session
-            .windows
-            .iter()
-            .enumerate()
-            .filter(|(_, w)| window.is_none_or(|selector| window_matches(selector, w)))
-            .collect();
-        if windows.is_empty() {
+    for (session_index, session) in snapshot.sessions.iter().enumerate() {
+        if selection.is_some_and(|(selected, _)| session_index != selected) {
             continue;
         }
-        matched = true;
+        if session.windows.is_empty() {
+            continue;
+        }
         lines.push(colors.paint("1;36", format!("Session: {}", session.name)));
-        for (index, window) in windows {
+        for (index, window) in session.windows.iter().enumerate() {
+            if selection.is_some_and(|(_, selected)| index != selected) {
+                continue;
+            }
             lines.push(colors.paint(
                 "1",
                 format!(
@@ -311,15 +371,9 @@ fn describe(snapshot: &Snapshot, window: Option<&str>, colors: Colors) -> Result
                     ),
                 ));
                 lines.push(format!("      {} {}", colors.paint("36", "cwd:"), pane.cwd));
-                lines.push(format!(
-                    "      {} {}",
-                    colors.paint("32", "command:"),
-                    if pane.command_line.is_empty() {
-                        &pane.command
-                    } else {
-                        &pane.command_line
-                    }
-                ));
+                let replay = tmux::replay_description(pane)
+                    .unwrap_or_else(|error| format!("Unavailable ({error:#})"));
+                lines.push(format!("      {} {replay}", colors.paint("32", "command:")));
                 if !pane.start_command.is_empty() {
                     lines.push(
                         colors.paint("2", format!("      started as: {}", pane.start_command)),
@@ -328,11 +382,5 @@ fn describe(snapshot: &Snapshot, window: Option<&str>, colors: Colors) -> Result
             }
         }
     }
-    anyhow::ensure!(
-        window.is_none() || matched,
-        "no window '{}' in snapshot '{}'",
-        window.unwrap_or_default(),
-        snapshot.name
-    );
     Ok(lines.join("\n"))
 }

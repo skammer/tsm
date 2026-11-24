@@ -19,22 +19,25 @@ impl Server {
     fn socket(&self) -> std::path::PathBuf {
         self.dir.path().join("tmux.sock")
     }
+    fn tmux_command(&self) -> Command {
+        let mut command = Command::new("tmux");
+        command
+            .arg("-S")
+            .arg(self.socket())
+            .args(["-f", "/dev/null"])
+            .env("HOME", self.dir.path())
+            .env("SHELL", "/bin/sh")
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE");
+        command
+    }
     fn tmux(&self, args: &[&str]) -> String {
-        output(
-            Command::new("tmux")
-                .arg("-S")
-                .arg(self.socket())
-                .args(["-f", "/dev/null"])
-                .args(args)
-                .env("HOME", self.dir.path())
-                .env("SHELL", "/bin/sh")
-                .env_remove("TMUX")
-                .env_remove("TMUX_PANE")
-                .output()
-                .unwrap(),
-        )
+        output(self.tmux_command().args(args).output().unwrap())
     }
     fn tsm_output(&self, args: &[&str], pane: Option<&str>) -> Output {
+        self.tsm_output_with_context(args, pane.map(|pane| (self, pane)))
+    }
+    fn tsm_output_with_context(&self, args: &[&str], context: Option<(&Server, &str)>) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_tsm"));
         command
             .args(args)
@@ -42,8 +45,18 @@ impl Server {
             .env("TSM_DATA_DIR", self.dir.path().join("store"))
             .env_remove("TMUX")
             .env_remove("TMUX_PANE");
-        if let Some(pane) = pane {
-            command.env("TMUX_PANE", pane);
+        if let Some((origin, pane)) = context {
+            let server =
+                origin.tmux(&["display-message", "-p", "-t", pane, "#{pid} #{session_id}"]);
+            let (pid, session) = server.split_once(' ').unwrap();
+            command.env("TMUX_PANE", pane).env(
+                "TMUX",
+                format!(
+                    "{},{pid},{}",
+                    origin.socket().display(),
+                    session.trim_start_matches('$')
+                ),
+            );
         }
         command.output().unwrap()
     }
@@ -101,6 +114,135 @@ fn rewrite_snapshot(server: &Server, snapshot: &Value) {
         .join("store")
         .join(format!("{}.json", snapshot["id"].as_str().unwrap()));
     fs::write(path, serde_json::to_vec(snapshot).unwrap()).unwrap();
+}
+
+#[test]
+#[ignore = "starts dedicated tmux servers; needs process inspection permissions"]
+fn batched_capture_preserves_text_and_rejects_foreign_pane_ids() {
+    let server = Server::new();
+    let other = Server::new();
+    let name = "  editor\t%1F\nlogs\x1f 字\\";
+    let cwd = server.dir.path().join(name);
+    fs::create_dir(&cwd).unwrap();
+    let pane = server.tmux(&[
+        "new-session",
+        "-d",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "-s",
+        "source",
+        "-n",
+        name,
+        "-c",
+        cwd.to_str().unwrap(),
+        "/bin/sleep",
+        "120",
+    ]);
+    let other_pane = other.tmux(&[
+        "new-session",
+        "-d",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "-s",
+        "foreign",
+        "/bin/sleep",
+        "120",
+    ]);
+    assert_eq!(pane, other_pane, "pane IDs are local to each server");
+    let saved = server.tsm(&["save", "window", "-n", "batched"], Some(&pane));
+    let snapshot = server.snapshot(saved_id(&saved));
+    let window = &snapshot["sessions"][0]["windows"][0];
+    assert_eq!(window["name"], name);
+    assert_eq!(
+        window["panes"][0]["cwd"],
+        cwd.canonicalize().unwrap().to_str().unwrap()
+    );
+    let selected = server.tsm(&["peek", "window", &format!("source:{name}")], None);
+    assert!(selected.contains(name));
+
+    for args in [
+        &["peek"][..],
+        &["peek", "session"][..],
+        &["restore", "batched"][..],
+    ] {
+        let failed = server.tsm_output_with_context(args, Some((&other, &other_pane)));
+        assert!(!failed.status.success(), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&failed.stderr).contains("different tmux server"),
+            "{args:?}: {:?}",
+            failed.stderr
+        );
+    }
+    assert_eq!(
+        server
+            .tmux(&["list-windows", "-F", "#{window_id}"])
+            .lines()
+            .count(),
+        1
+    );
+    assert!(
+        server
+            .tsm_output_with_context(&["peek", "window", "source:0"], Some((&other, &other_pane)))
+            .status
+            .success(),
+        "explicitly qualified targets can still use the socket override"
+    );
+}
+
+#[test]
+#[ignore = "starts a dedicated tmux server; needs process inspection permissions"]
+fn restore_reports_partial_launch_failure_and_keeps_both_panes_usable() {
+    let server = Server::new();
+    let pane = server.tmux(&[
+        "new-session",
+        "-d",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "-s",
+        "source",
+        "/bin/sleep",
+        "120",
+    ]);
+    server.tmux(&["split-window", "-d", "-t", &pane, "/bin/sleep", "120"]);
+    let saved = server.tsm(&["save", "session", "-n", "replay"], Some(&pane));
+    let mut snapshot = server.snapshot(saved_id(&saved));
+    let panes = snapshot["sessions"][0]["windows"][0]["panes"]
+        .as_array_mut()
+        .unwrap();
+    let missing = server.dir.path().join("missing-program");
+    panes[0]["argv"] = serde_json::json!([missing]);
+    panes[0]["command_line"] = "stale preview".into();
+    panes[1]["argv"] =
+        serde_json::json!(["/bin/sh", "-c", "printf 'REPLAY_CHECK\\n'; read answer"]);
+    rewrite_snapshot(&server, &snapshot);
+
+    let preview = server.tsm(&["inspect", "replay"], None);
+    assert!(preview.contains("missing-program"));
+    assert!(!preview.contains("stale preview"));
+    let restored = server.tsm_output(&["restore", "replay"], None);
+    assert!(!restored.status.success());
+    assert!(String::from_utf8_lossy(&restored.stdout).contains("created layout"));
+    let error = String::from_utf8_lossy(&restored.stderr);
+    assert!(error.contains("program startup issues"), "{error}");
+    assert!(error.contains("missing-program"), "{error}");
+
+    wait_screen(&server, "replay:0.1", "REPLAY_CHECK");
+    server.tmux(&["send-keys", "-t", "replay:0.1", "Enter"]);
+    for target in ["replay:0.0", "replay:0.1"] {
+        wait_screen(&server, target, "$");
+        server.tmux(&[
+            "send-keys",
+            "-t",
+            target,
+            "-l",
+            "printf 'SHELL_%s\\n' ALIVE",
+        ]);
+        server.tmux(&["send-keys", "-t", target, "Enter"]);
+        wait_screen(&server, target, "SHELL_ALIVE");
+    }
 }
 
 #[test]
@@ -765,28 +907,35 @@ fn all_scopes_commands_layouts_queries_and_rollback() {
         "alpha",
         "-n",
         "tsm-ui",
+        "/bin/sleep",
+        "120",
+    ]);
+    server.tmux(&["resize-window", "-t", &tui, "-x", "120", "-y", "24"]);
+    server.tmux(&[
+        "respawn-pane",
+        "-k",
+        "-t",
+        &tui,
         "env",
         &format!("TSM_TMUX_SOCKET={}", server.socket().display()),
         &format!("TSM_DATA_DIR={}", server.dir.path().join("store").display()),
         env!("CARGO_BIN_EXE_tsm"),
     ]);
-    server.tmux(&["resize-window", "-t", &tui, "-x", "120", "-y", "24"]);
     wait_screen(&server, &tui, "Saved snapshots");
     server.tmux(&["send-keys", "-t", &tui, "/Pprj", "Enter"]);
     wait_screen(&server, &tui, "› Personal projects");
-    server.tmux(&[
-        "send-keys",
-        "-t",
-        &tui,
-        "NPage",
-        "NPage",
-        "NPage",
-        "NPage",
-        "NPage",
-    ]);
+    let inspector = wait_screen(&server, &tui, "/usr/bin/tail -f");
+    assert!(inspector.contains("Window 7: logs"), "{inspector}");
+    assert!(!inspector.contains("logs pane"), "{inspector}");
+    server.tmux(&["send-keys", "-t", &tui, "Tab", "Down", "Down", "Right"]);
     wait_screen(&server, &tui, "logs pane");
+    let sessions_before = server.tmux(&["list-sessions", "-F", "#{session_id}"]);
     server.tmux(&["send-keys", "-t", &tui, "r"]);
     wait_screen(&server, &tui, "Restored:");
+    assert_ne!(
+        server.tmux(&["list-sessions", "-F", "#{session_id}"]),
+        sessions_before
+    );
     server.tmux(&["send-keys", "-t", &tui, "w", "TUI snapshot", "Enter"]);
     let screen = wait_screen(&server, &tui, "Saved: ");
     println!("TUI verified:\n{screen}");
@@ -797,19 +946,26 @@ fn all_scopes_commands_layouts_queries_and_rollback() {
     );
     server.tmux(&["send-keys", "-t", &tui, "/"]);
     server.tmux(&["send-keys", "-t", &tui, "C-u", "TUI snapshot", "Enter"]);
-    let screen = wait_screen(&server, &tui, "tsm-ui");
+    let screen = wait_screen(&server, &tui, "Saved snapshots (1/");
     assert!(!screen.contains("Layout:"));
     server.tmux(&["send-keys", "-t", &tui, "/", "C-u", "missing filter"]);
     wait_screen(&server, &tui, "No matches.");
     server.tmux(&["send-keys", "-t", &tui, "Escape"]);
-    wait_screen(&server, &tui, "tsm-ui");
+    wait_screen(&server, &tui, "Saved snapshots (1/");
     server.tmux(&["resize-window", "-t", &tui, "-x", "44", "-y", "12"]);
     let compact = wait_screen(&server, &tui, "Tab inspect");
     assert!(!compact.contains("Inspector"));
     server.tmux(&["send-keys", "-t", &tui, "Enter"]);
-    let compact = wait_screen(&server, &tui, "tsm-ui");
+    let compact = wait_screen(&server, &tui, "Interactive shell");
     assert!(compact.contains("Inspector"));
+    assert!(compact.contains("Session alpha"));
+    assert!(compact.contains("tsm-ui"));
+    assert_eq!(compact.matches("cwd:").count(), 1, "{compact}");
     println!("Compact TUI verified:\n{compact}");
+    server.tmux(&["send-keys", "-t", &tui, "i"]);
+    let details = wait_screen(&server, &tui, "Inspector · details");
+    assert_eq!(details.matches("cwd:").count(), 1, "{details}");
+    server.tmux(&["send-keys", "-t", &tui, "i"]);
     server.tmux(&["send-keys", "-t", &tui, "?"]);
     wait_screen(&server, &tui, "Keyboard shortcuts");
     server.tmux(&["send-keys", "-t", &tui, "End"]);
@@ -817,7 +973,7 @@ fn all_scopes_commands_layouts_queries_and_rollback() {
     server.tmux(&["send-keys", "-t", &tui, "Escape"]);
     wait_screen(&server, &tui, "Inspector");
     server.tmux(&["resize-window", "-t", &tui, "-x", "120", "-y", "24"]);
-    server.tmux(&["send-keys", "-t", &tui, "i"]);
+    server.tmux(&["send-keys", "-t", &tui, "Down", "Right", "i"]);
     wait_screen(&server, &tui, "Layout:");
     server.tmux(&["send-keys", "-t", &tui, "i", "d"]);
     wait_screen(&server, &tui, "y confirm");
@@ -872,6 +1028,159 @@ fn all_scopes_commands_layouts_queries_and_rollback() {
             geometry(&server, expected)
         );
     }
+}
+
+#[test]
+#[ignore = "starts dedicated tmux servers; needs process inspection permissions"]
+fn tui_restore_and_jump_opens_the_restored_target() {
+    let server = Server::new();
+    let terminal = Server::new();
+    server.tmux(&["new-session", "-d", "-s", "source"]);
+    server.tmux(&["new-window", "-t", "source:", "-n", "work"]);
+    server.tmux(&["new-session", "-d", "-s", "z-other"]);
+    server.tsm(
+        &["save", "window", "source:work", "-n", "WindowSaved"],
+        None,
+    );
+    server.tsm(&["save", "session", "source"], None);
+    server.tsm(&["save", "all", "-n", "Everything"], None);
+    server.tmux(&[
+        "set-option",
+        "-g",
+        "status-left",
+        "#{session_name} #{window_name}",
+    ]);
+    server.tmux(&["set-option", "-g", "status-left-length", "80"]);
+
+    let socket = server.socket();
+    let display = terminal.tmux(&[
+        "new-session",
+        "-dP",
+        "-F",
+        "#{pane_id}",
+        "-x",
+        "100",
+        "-s",
+        "terminal",
+        "env",
+        "-u",
+        "TMUX",
+        "-u",
+        "TMUX_PANE",
+        "tmux",
+        "-S",
+        socket.to_str().unwrap(),
+        "attach-session",
+        "-t",
+        "source",
+    ]);
+    wait_screen(&terminal, &display, "source work");
+    let client = server.tmux(&["list-clients", "-t", "source", "-F", "#{client_name}"]);
+    let socket_env = format!("TSM_TMUX_SOCKET={}", socket.display());
+    let store_env = format!("TSM_DATA_DIR={}", server.dir.path().join("store").display());
+    for (snapshot, expected_session) in [("WindowSaved", "source"), ("source", "source-restored-1")]
+    {
+        server.tmux(&["switch-client", "-c", &client, "-t", "source"]);
+        let tui = server.tmux(&[
+            "new-window",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            "source:",
+            "-n",
+            "manager",
+            "env",
+            &socket_env,
+            &store_env,
+            env!("CARGO_BIN_EXE_tsm"),
+        ]);
+        wait_screen(&server, &tui, "Saved snapshots");
+        server.tmux(&["send-keys", "-t", &tui, "/", snapshot, "Enter"]);
+        wait_screen(&server, &tui, &format!("› {snapshot}"));
+        let background_window = if snapshot == "WindowSaved" {
+            server.tmux(&["send-keys", "-t", &tui, "r"]);
+            wait_screen(&server, &tui, "Restored:");
+            assert_eq!(
+                server.tmux(&["display-message", "-p", "-t", "source:", "#{pane_id}"]),
+                tui
+            );
+            server.tmux(&["display-message", "-p", "-t", "source:$", "#{window_id}"])
+        } else {
+            String::new()
+        };
+        server.tmux(&["send-keys", "-t", &tui, "R"]);
+        wait_screen(&terminal, &display, &format!("{expected_session} work"));
+        assert_eq!(
+            server.tmux(&["display-message", "-p", "-c", &client, "#{client_session}"]),
+            expected_session
+        );
+        assert_ne!(
+            server.tmux(&[
+                "display-message",
+                "-p",
+                "-t",
+                &format!("{expected_session}:"),
+                "#{window_id}",
+            ]),
+            background_window
+        );
+    }
+    server.tmux(&["switch-client", "-c", &client, "-t", "source"]);
+    let mut popup = server
+        .tmux_command()
+        .args([
+            "display-popup",
+            "-c",
+            &client,
+            "-t",
+            "source:",
+            "-E",
+            "-w",
+            "90%",
+            "-h",
+            "90%",
+            "env",
+            &socket_env,
+            &store_env,
+            env!("CARGO_BIN_EXE_tsm"),
+        ])
+        .spawn()
+        .unwrap();
+    wait_screen(&terminal, &display, "Saved snapshots");
+    terminal.tmux(&["send-keys", "-t", &display, "/Everything", "Enter"]);
+    wait_screen(&terminal, &display, "› Everything");
+    terminal.tmux(&["send-keys", "-t", &display, "R"]);
+    wait_screen(&terminal, &display, "source-restored-2 work");
+    assert!(popup.wait().unwrap().success());
+    server.tmux(&["has-session", "-t", "=z-other-restored-1"]);
+
+    let outside = terminal.tmux(&[
+        "new-window",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "-t",
+        "terminal:",
+        "env",
+        "-u",
+        "TMUX",
+        "-u",
+        "TMUX_PANE",
+        &socket_env,
+        &store_env,
+        env!("CARGO_BIN_EXE_tsm"),
+    ]);
+    wait_screen(&terminal, &outside, "Saved snapshots");
+    terminal.tmux(&["send-keys", "-t", &outside, "/WindowSaved", "Enter"]);
+    wait_screen(&terminal, &outside, "› WindowSaved");
+    terminal.tmux(&["send-keys", "-t", &outside, "R"]);
+    wait_screen(&terminal, &outside, "WindowSaved work");
+    assert!(
+        !server
+            .tmux(&["list-clients", "-t", "WindowSaved", "-F", "#{client_name}"])
+            .is_empty()
+    );
 }
 
 fn wait_screen(server: &Server, pane: &str, expected: &str) -> String {

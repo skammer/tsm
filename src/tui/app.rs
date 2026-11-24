@@ -1,3 +1,8 @@
+use std::{
+    sync::mpsc::{self, Receiver, TryRecvError},
+    thread,
+};
+
 use anyhow::Result;
 use ratatui::{
     crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -11,6 +16,8 @@ use crate::{
     store::Store,
     tmux,
 };
+
+use super::inspect::Outline;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Focus {
@@ -34,11 +41,24 @@ pub(super) enum Mode {
     Help {
         scroll: u16,
     },
+    ErrorDetails {
+        scroll: u16,
+    },
+    RestoreWorking {
+        receiver: Receiver<RestoreUpdate>,
+        message: String,
+        jump: bool,
+    },
+}
+
+pub(super) enum RestoreUpdate {
+    Progress(String),
+    Finished(Result<tmux::RestoreReport>),
 }
 
 pub(super) struct Status {
     pub message: String,
-    pub error: bool,
+    pub details: Option<String>,
 }
 
 pub(super) struct App {
@@ -55,7 +75,8 @@ pub(super) struct App {
     pub list_page: usize,
     pub compact: bool,
     pub focus: Focus,
-    pub expanded: bool,
+    pub details: bool,
+    pub outline: Outline,
 }
 
 impl App {
@@ -74,7 +95,8 @@ impl App {
             list_page: 1,
             compact: false,
             focus: Focus::List,
-            expanded: false,
+            details: false,
+            outline: Outline::default(),
         };
         app.update_catalog(None);
         app
@@ -111,15 +133,17 @@ impl App {
         self.list_state
             .select((!self.visible.is_empty()).then_some(index));
         self.scroll = 0;
+        self.outline = Outline::default();
     }
 
     fn move_selection(&mut self, delta: isize) {
         let index = self.list_state.selected().unwrap_or(0);
-        self.select(
-            index
-                .saturating_add_signed(delta)
-                .min(self.visible.len().saturating_sub(1)),
-        );
+        let next = index
+            .saturating_add_signed(delta)
+            .min(self.visible.len().saturating_sub(1));
+        if next != index {
+            self.select(next);
+        }
     }
 
     pub fn reload(&mut self, store: &Store) -> Result<()> {
@@ -132,13 +156,15 @@ impl App {
     }
 
     pub fn handle_key(&mut self, store: &Store, key: KeyEvent) -> bool {
+        if self.restore_working() {
+            return false;
+        }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return true;
         }
         if matches!(self.mode, Mode::Browse) {
             return self.browse(store, key);
         }
-
         let mut mode = std::mem::take(&mut self.mode);
         match &mut mode {
             Mode::Filter {
@@ -177,17 +203,15 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('n' | 'N') => return false,
                 _ => {}
             },
-            Mode::Help { scroll } => match key.code {
-                KeyCode::Esc | KeyCode::Char('?' | 'q') => return false,
-                KeyCode::Down | KeyCode::Char('j') => *scroll = scroll.saturating_add(1),
-                KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
-                KeyCode::PageDown => *scroll = scroll.saturating_add(self.page_height),
-                KeyCode::PageUp => *scroll = scroll.saturating_sub(self.page_height),
-                KeyCode::Home => *scroll = 0,
-                KeyCode::End => *scroll = u16::MAX,
-                _ => {}
-            },
-            Mode::Browse => {}
+            Mode::Help { .. } if matches!(key.code, KeyCode::Char('?' | 'q')) => return false,
+            Mode::ErrorDetails { .. } if key.code == KeyCode::Char('e') => return false,
+            Mode::Help { scroll } | Mode::ErrorDetails { scroll } => {
+                if key.code == KeyCode::Esc {
+                    return false;
+                }
+                scroll_document(scroll, key.code, self.page_height);
+            }
+            Mode::Browse | Mode::RestoreWorking { .. } => {}
         }
         self.mode = mode;
         false
@@ -208,19 +232,12 @@ impl App {
                 self.apply_filter(self.selected().map(|snapshot| snapshot.id));
             }
             KeyCode::Char('q') | KeyCode::Esc => return true,
-            KeyCode::Down | KeyCode::Char('j') if in_inspector => {
-                self.scroll = self.scroll.saturating_add(1)
-            }
-            KeyCode::Up | KeyCode::Char('k') if in_inspector => {
-                self.scroll = self.scroll.saturating_sub(1)
-            }
+            KeyCode::Down | KeyCode::Char('j') if in_inspector => self.outline.move_selection(1),
+            KeyCode::Up | KeyCode::Char('k') if in_inspector => self.outline.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
-            KeyCode::PageDown if in_inspector || !self.compact => {
-                self.scroll = self.scroll.saturating_add(self.page_height)
-            }
-            KeyCode::PageUp if in_inspector || !self.compact => {
-                self.scroll = self.scroll.saturating_sub(self.page_height)
+            KeyCode::PageDown | KeyCode::PageUp if in_inspector || !self.compact => {
+                scroll_document(&mut self.scroll, key.code, self.page_height)
             }
             KeyCode::PageDown => self.move_selection(self.list_page as isize),
             KeyCode::PageUp => self.move_selection(-(self.list_page as isize)),
@@ -229,25 +246,28 @@ impl App {
             KeyCode::Home => self.select(0),
             KeyCode::End => self.select(self.visible.len().saturating_sub(1)),
             _ if key.kind != KeyEventKind::Press => {}
+            KeyCode::Right if in_inspector => self.outline.expand(),
+            KeyCode::Left if in_inspector => self.outline.collapse(),
             KeyCode::Tab | KeyCode::BackTab | KeyCode::Enter if self.selected().is_some() => {
                 self.focus = if in_inspector {
                     Focus::List
                 } else {
+                    self.outline.reveal = true;
                     Focus::Inspector
                 };
             }
             KeyCode::Char('g') => {
                 self.status = None;
                 if let Err(error) = self.reload(store) {
-                    self.report(Err(error));
+                    self.report(Err(error), "Reload failed");
                 }
             }
             KeyCode::Char('d') | KeyCode::Delete if self.selected().is_some() => {
                 self.mode = Mode::Delete
             }
             KeyCode::Char('i') if self.selected().is_some() => {
-                self.expanded = !self.expanded;
-                self.scroll = 0;
+                self.details = !self.details;
+                self.outline.reveal = in_inspector || self.compact;
                 if self.compact {
                     self.focus = Focus::Inspector;
                 }
@@ -270,12 +290,17 @@ impl App {
                 };
             }
             KeyCode::Char('?') => self.mode = Mode::Help { scroll: 0 },
-            KeyCode::Char('r') => {
-                if let Some(snapshot) = self.selected() {
-                    self.report(
-                        tmux::restore(snapshot)
-                            .map(|names| format!("Restored: {}", names.join(", "))),
-                    );
+            KeyCode::Char('e')
+                if self
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.details.is_some()) =>
+            {
+                self.mode = Mode::ErrorDetails { scroll: 0 };
+            }
+            KeyCode::Char(c @ ('r' | 'R')) => {
+                if let Some(snapshot) = self.selected().cloned() {
+                    self.start_restore(snapshot, c == 'R');
                 }
             }
             _ => {}
@@ -283,10 +308,99 @@ impl App {
         false
     }
 
-    fn report(&mut self, result: Result<String>) {
-        let error = result.is_err();
-        let message = result.unwrap_or_else(|error| format!("Error: {error:#}"));
-        self.status = Some(Status { message, error });
+    fn report(&mut self, result: Result<String>, summary: &str) {
+        self.status = Some(match result {
+            Ok(message) => Status {
+                message,
+                details: None,
+            },
+            Err(error) => Status {
+                message: summary.into(),
+                details: Some(format!("{error:#}")),
+            },
+        });
+    }
+
+    fn start_restore(&mut self, snapshot: Snapshot, jump: bool) {
+        let (sender, receiver) = mpsc::channel();
+        self.status = None;
+        match thread::Builder::new()
+            .name("tsm-restore".into())
+            .spawn(move || {
+                let result = tmux::plan_restore(&snapshot).and_then(|plan| {
+                    tmux::execute_restore(plan, |message| {
+                        let _ = sender.send(RestoreUpdate::Progress(message));
+                    })
+                });
+                let _ = sender.send(RestoreUpdate::Finished(result));
+            }) {
+            Ok(_) => {
+                self.mode = Mode::RestoreWorking {
+                    receiver,
+                    message: "Checking saved panes…".into(),
+                    jump,
+                };
+            }
+            Err(error) => self.report(Err(error.into()), "Restore failed"),
+        }
+    }
+
+    pub fn restore_working(&self) -> bool {
+        matches!(self.mode, Mode::RestoreWorking { .. })
+    }
+
+    pub fn poll_restore(&mut self) -> Option<tmux::RestoreReport> {
+        let Mode::RestoreWorking {
+            receiver,
+            message,
+            jump,
+        } = &mut self.mode
+        else {
+            return None;
+        };
+        loop {
+            match receiver.try_recv() {
+                Ok(RestoreUpdate::Progress(progress)) => {
+                    *message = progress;
+                    continue;
+                }
+                Ok(RestoreUpdate::Finished(Ok(report))) if *jump => return Some(report),
+                Ok(RestoreUpdate::Finished(Ok(report))) => {
+                    self.mode = Mode::Browse;
+                    let restored = format!("Restored: {}", report.targets.join(", "));
+                    match report.failures.len() {
+                        0 => self.report(Ok(restored), ""),
+                        failed => {
+                            self.status = Some(Status {
+                                message: if failed == 1 {
+                                    "Restored · startup issue in 1 pane".into()
+                                } else {
+                                    format!("Restored · startup issues in {failed} panes")
+                                },
+                                details: Some(format!(
+                                    "{restored}\n\n{}",
+                                    report.failures.join("\n\n")
+                                )),
+                            });
+                        }
+                    }
+                }
+                Ok(RestoreUpdate::Finished(Err(error))) => {
+                    self.mode = Mode::Browse;
+                    self.report(Err(error), "Restore failed");
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.mode = Mode::Browse;
+                    self.report(
+                        Err(anyhow::anyhow!("Restore worker stopped")),
+                        "Restore interrupted",
+                    );
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+            break;
+        }
+        None
     }
 
     fn save(&mut self, store: &Store, scope: Scope, name: &str) {
@@ -309,7 +423,7 @@ impl App {
                 snapshot.name
             ))
         });
-        self.report(result);
+        self.report(result, "Save failed");
     }
 
     fn delete(&mut self, store: &Store) {
@@ -326,8 +440,20 @@ impl App {
             }
             Ok(format!("Deleted: {name}"))
         });
-        self.report(result);
+        self.report(result, "Delete failed");
     }
+}
+
+fn scroll_document(scroll: &mut u16, code: KeyCode, page_height: u16) {
+    *scroll = match code {
+        KeyCode::Down | KeyCode::Char('j') => scroll.saturating_add(1),
+        KeyCode::Up | KeyCode::Char('k') => scroll.saturating_sub(1),
+        KeyCode::PageDown => scroll.saturating_add(page_height),
+        KeyCode::PageUp => scroll.saturating_sub(page_height),
+        KeyCode::Home => 0,
+        KeyCode::End => u16::MAX,
+        _ => *scroll,
+    };
 }
 
 fn edit(text: &mut String, code: KeyCode, modifiers: KeyModifiers) -> bool {

@@ -7,6 +7,18 @@ pub enum Replay {
     Script(String),
 }
 
+pub fn replay_description(pane: &PaneSnapshot) -> Result<String> {
+    Ok(describe_replay(restore_command(pane)?.as_ref()))
+}
+
+pub(super) fn describe_replay(replay: Option<&Replay>) -> String {
+    match replay {
+        Some(Replay::Arguments(argv)) => shell_words::join(argv),
+        Some(Replay::Script(script)) => format!("Shell script · {script}"),
+        None => "Interactive shell".into(),
+    }
+}
+
 pub fn restore_command(pane: &PaneSnapshot) -> Result<Option<Replay>> {
     ensure!(
         !pane.argv.iter().any(|arg| arg.contains('\0'))
@@ -90,8 +102,13 @@ mod tests {
             restore_command(&pane).unwrap(),
             Some(Replay::Arguments(pane.argv.clone()))
         );
+        assert_eq!(
+            replay_description(&pane).unwrap(),
+            shell_words::join(&pane.argv)
+        );
         pane.argv = vec!["/tmp/tsm".into(), "save".into()];
         assert_eq!(restore_command(&pane).unwrap(), None);
+        assert_eq!(replay_description(&pane).unwrap(), "Interactive shell");
     }
     #[test]
     fn start_command_round_trip() {
@@ -100,6 +117,10 @@ mod tests {
         assert_eq!(
             restore_command(&pane).unwrap(),
             Some(Replay::Script("sleep 120".into()))
+        );
+        assert_eq!(
+            replay_description(&pane).unwrap(),
+            "Shell script · sleep 120"
         );
         pane.start_command = "\"printf\" \"a b\"".into();
         assert_eq!(

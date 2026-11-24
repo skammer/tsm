@@ -1,11 +1,84 @@
 use super::{
-    client::{current_pane, field, format_literal, run},
-    command::restore_command,
+    client::{attach_or_switch, current_pane_optional, field, format_literal, run},
+    command::{Replay, restore_command},
     launch::Launch,
 };
 use crate::model::{Scope, Snapshot, WindowSnapshot};
 use anyhow::{Context, Result, bail, ensure};
 use std::path::Path;
+
+pub struct RestorePlan {
+    panes: Vec<RestorePane>,
+    snapshot: Snapshot,
+    target: Destination,
+}
+
+struct RestorePane {
+    label: String,
+    cwd: String,
+    title: String,
+    replay: Option<Replay>,
+}
+
+pub struct RestoreReport {
+    pub targets: Vec<String>,
+    pub failures: Vec<String>,
+    pub jump_target: RestoredTarget,
+}
+
+pub enum RestoredTarget {
+    Window(String),
+    Session(String),
+}
+
+impl RestoredTarget {
+    pub fn jump(&self) -> Result<()> {
+        match self {
+            Self::Window(target) => {
+                run(&["select-window", "-t", target])?;
+                Ok(())
+            }
+            Self::Session(id) => attach_or_switch(id),
+        }
+    }
+}
+
+#[derive(PartialEq, Eq)]
+enum Destination {
+    CurrentSession { id: String, name: String },
+    NewSessions(Vec<String>),
+}
+
+impl Destination {
+    fn resolve(snapshot: &Snapshot) -> Result<Self> {
+        if snapshot.scope == Scope::Window
+            && let Some(pane) = current_pane_optional()?
+        {
+            let id = field(&pane, "session_id")?;
+            let name = field(&id, "session_name")?;
+            return Ok(Self::CurrentSession { id, name });
+        }
+        let mut names = Vec::new();
+        for session in &snapshot.sessions {
+            let preferred = if snapshot.scope == Scope::All {
+                &session.name
+            } else {
+                &snapshot.name
+            };
+            names.push(unique_name(preferred, &names)?);
+        }
+        Ok(Self::NewSessions(names))
+    }
+
+    fn check(&self, snapshot: &Snapshot) -> Result<()> {
+        let unchanged = match self {
+            Self::CurrentSession { .. } => Self::resolve(snapshot)? == *self,
+            Self::NewSessions(names) => names.iter().all(|name| session_name_available(name)),
+        };
+        ensure!(unchanged, "restore destination changed; retry restore");
+        Ok(())
+    }
+}
 
 #[derive(Default)]
 struct Transaction {
@@ -26,23 +99,44 @@ impl Transaction {
     }
 }
 
-pub fn restore(snapshot: &Snapshot) -> Result<Vec<String>> {
+pub fn plan_restore(snapshot: &Snapshot) -> Result<RestorePlan> {
     snapshot.validate()?;
-    for pane in snapshot
-        .sessions
-        .iter()
-        .flat_map(|s| &s.windows)
-        .flat_map(|w| &w.panes)
-    {
-        ensure!(
-            Path::new(&pane.cwd).is_dir(),
-            "saved directory is unavailable: {}",
-            pane.cwd
-        );
-        restore_command(pane)?;
+    let mut panes = Vec::new();
+    for session in &snapshot.sessions {
+        for window in &session.windows {
+            for (index, pane) in window.panes.iter().enumerate() {
+                let label = format!(
+                    "{}:{} {} · pane {index}",
+                    session.name, window.index, window.name
+                );
+                let replay = restore_command(pane).with_context(|| label.clone())?;
+                panes.push(RestorePane {
+                    label,
+                    cwd: pane.cwd.clone(),
+                    title: pane.title.clone(),
+                    replay,
+                });
+            }
+        }
     }
+    check_directories(&panes)?;
+    let target = Destination::resolve(snapshot)?;
+    Ok(RestorePlan {
+        panes,
+        snapshot: snapshot.clone(),
+        target,
+    })
+}
+
+pub fn execute_restore(
+    plan: RestorePlan,
+    mut progress: impl FnMut(String),
+) -> Result<RestoreReport> {
+    progress("Checking restore destination".into());
+    check_directories(&plan.panes)?;
+    plan.target.check(&plan.snapshot)?;
     let mut transaction = Transaction::default();
-    let result = restore_inner(snapshot, &mut transaction);
+    let result = restore_inner(&plan, &mut transaction, &mut progress);
     if let Err(error) = result {
         let failures = transaction.rollback();
         if failures.is_empty() {
@@ -56,69 +150,81 @@ pub fn restore(snapshot: &Snapshot) -> Result<Vec<String>> {
     result
 }
 
-fn restore_inner(snapshot: &Snapshot, tx: &mut Transaction) -> Result<Vec<String>> {
+fn check_directories(panes: &[RestorePane]) -> Result<()> {
+    for pane in panes {
+        ensure!(
+            Path::new(&pane.cwd).is_dir(),
+            "saved directory is unavailable: {}",
+            pane.cwd
+        );
+    }
+    Ok(())
+}
+
+fn restore_inner(
+    plan: &RestorePlan,
+    tx: &mut Transaction,
+    progress: &mut impl FnMut(String),
+) -> Result<RestoreReport> {
+    let snapshot = &plan.snapshot;
     let mut launches = Vec::new();
     let mut restored = Vec::new();
     let mut focuses = Vec::new();
-    let existing_session = if snapshot.scope == Scope::Window {
-        current_pane()
-            .ok()
-            .map(|pane| field(&pane, "session_id"))
-            .transpose()?
-    } else {
-        None
-    };
+    let mut jump_target = None;
 
-    for session in &snapshot.sessions {
-        let (session_id, first_window, owns_session) = if let Some(id) = &existing_session {
-            let window = create_window(id, &session.windows[0], None)?;
-            tx.created.push(("kill-window", window.clone()));
-            restored.push(format!(
-                "window {} in {}",
-                session.windows[0].name,
-                field(id, "session_name")?
-            ));
-            (id.clone(), window, false)
-        } else {
-            let preferred = if snapshot.scope == Scope::All {
-                &session.name
-            } else {
-                &snapshot.name
-            };
-            let name = unique_name(preferred)?;
-            let value = run(&[
-                "new-session",
-                "-d",
-                "-P",
-                "-F",
-                "#{session_id} #{window_id}",
-                "-s",
-                &format_literal(&name),
-                "-n",
-                &format_literal(&session.windows[0].name),
-                "-c",
-                &format_literal(&session.windows[0].panes[0].cwd),
-                "/bin/sleep",
-                "86400",
-            ])?;
-            let (id, window) = value
-                .split_once(' ')
-                .context("invalid new-session result")?;
-            tx.created.push(("kill-session", id.into()));
-            run(&["set-option", "-t", id, "renumber-windows", "off"])?;
-            let first_index = session.windows[0].index.to_string();
-            if field(window, "window_index")? != first_index {
-                run(&[
-                    "move-window",
-                    "-s",
-                    window,
-                    "-t",
-                    &format!("{id}:{first_index}"),
-                ])?;
+    let mut panes = plan.panes.iter();
+    for (session_index, session) in snapshot.sessions.iter().enumerate() {
+        let (session_id, first_window, owns_session) = match &plan.target {
+            Destination::CurrentSession { id, name } => {
+                let window = create_window(id, &session.windows[0], None)?;
+                tx.created.push(("kill-window", window.clone()));
+                restored.push(format!("window {} in {name}", session.windows[0].name));
+                (id.clone(), window, false)
             }
-            restored.push(name);
-            (id.into(), window.into(), true)
+            Destination::NewSessions(names) => {
+                let name = &names[session_index];
+                progress(format!("Creating session {name}"));
+                let value = run(&[
+                    "new-session",
+                    "-d",
+                    "-P",
+                    "-F",
+                    "#{session_id} #{window_id}",
+                    "-s",
+                    &format_literal(name),
+                    "-n",
+                    &format_literal(&session.windows[0].name),
+                    "-c",
+                    &format_literal(&session.windows[0].panes[0].cwd),
+                    "/bin/sleep",
+                    "86400",
+                ])?;
+                let (id, window) = value
+                    .split_once(' ')
+                    .context("invalid new-session result")?;
+                tx.created.push(("kill-session", id.into()));
+                run(&["set-option", "-t", id, "renumber-windows", "off"])?;
+                let first_index = session.windows[0].index.to_string();
+                if field(window, "window_index")? != first_index {
+                    run(&[
+                        "move-window",
+                        "-s",
+                        window,
+                        "-t",
+                        &format!("{id}:{first_index}"),
+                    ])?;
+                }
+                restored.push(name.clone());
+                (id.into(), window.into(), true)
+            }
         };
+        jump_target.get_or_insert_with(|| {
+            if owns_session {
+                RestoredTarget::Session(session_id.clone())
+            } else {
+                RestoredTarget::Window(format!("{session_id}:{first_window}"))
+            }
+        });
         let mut window_ids = vec![first_window];
         for window in session.windows.iter().skip(1) {
             let id = create_window(&session_id, window, Some(window.index))?;
@@ -128,15 +234,32 @@ fn restore_inner(snapshot: &Snapshot, tx: &mut Transaction) -> Result<Vec<String
             window_ids.push(id);
         }
         for (id, window) in window_ids.iter().zip(&session.windows) {
-            let pane = prepare_window(id, window, &mut launches)?;
-            focuses.push((id.clone(), pane, window.zoomed));
+            progress(format!("Rebuilding window {}", window.name));
+            let ids = prepare_window(id, window)?;
+            focuses.push((id.clone(), ids[window.active_pane].clone(), window.zoomed));
+            launches.extend(ids.into_iter().zip(&mut panes).map(|(id, pane)| {
+                (
+                    &pane.label,
+                    Launch {
+                        pane: id,
+                        cwd: &pane.cwd,
+                        command: pane.replay.as_ref(),
+                        title: &pane.title,
+                    },
+                )
+            }));
         }
         if owns_session {
             run(&["select-window", "-t", &window_ids[session.active_window]])?;
         }
     }
-    for launch in launches {
-        launch.start()?;
+    let mut startups = Vec::new();
+    let count = launches.len();
+    for (index, (label, launch)) in launches.into_iter().enumerate() {
+        progress(format!("Starting pane {} of {count} · {label}", index + 1));
+        if let Some(startup) = launch.start()? {
+            startups.push((label, startup));
+        }
     }
     for (window, pane, zoomed) in focuses {
         run(&["select-pane", "-t", &pane])?;
@@ -145,7 +268,21 @@ fn restore_inner(snapshot: &Snapshot, tx: &mut Transaction) -> Result<Vec<String
         }
         run(&["set-option", "-w", "-t", &window, "window-size", "latest"])?;
     }
-    Ok(restored)
+    let failures = startups
+        .into_iter()
+        .filter_map(|(label, startup)| {
+            progress(format!("Checking startup · {label}"));
+            startup
+                .wait()
+                .err()
+                .map(|error| format!("{label}: {error:#}"))
+        })
+        .collect();
+    Ok(RestoreReport {
+        targets: restored,
+        failures,
+        jump_target: jump_target.context("restore created no sessions or windows")?,
+    })
 }
 
 fn create_window(session: &str, window: &WindowSnapshot, index: Option<usize>) -> Result<String> {
@@ -169,7 +306,7 @@ fn create_window(session: &str, window: &WindowSnapshot, index: Option<usize>) -
     ])
 }
 
-fn prepare_window(id: &str, window: &WindowSnapshot, launches: &mut Vec<Launch>) -> Result<String> {
+fn prepare_window(id: &str, window: &WindowSnapshot) -> Result<Vec<String>> {
     let (width, height) = dimensions(&window.layout)?;
     run(&["set-option", "-w", "-t", id, "automatic-rename", "off"])?;
     run(&["set-option", "-w", "-t", id, "allow-rename", "off"])?;
@@ -208,15 +345,7 @@ fn prepare_window(id: &str, window: &WindowSnapshot, launches: &mut Vec<Launch>)
         &height.to_string(),
     ])?;
     run(&["select-layout", "-t", id, &window.layout])?;
-    for (id, pane) in ids.iter().zip(&window.panes) {
-        launches.push(Launch {
-            pane: id.clone(),
-            cwd: pane.cwd.clone(),
-            command: restore_command(pane)?,
-            title: pane.title.clone(),
-        });
-    }
-    Ok(ids[window.active_pane].clone())
+    Ok(ids)
 }
 
 fn dimensions(layout: &str) -> Result<(usize, usize)> {
@@ -227,7 +356,7 @@ fn dimensions(layout: &str) -> Result<(usize, usize)> {
     Ok((width, height))
 }
 
-fn unique_name(preferred: &str) -> Result<String> {
+fn unique_name(preferred: &str, reserved: &[String]) -> Result<String> {
     let base = preferred.replace(['.', ':'], "_");
     for suffix in 0..10_000 {
         let name = if suffix == 0 {
@@ -235,9 +364,13 @@ fn unique_name(preferred: &str) -> Result<String> {
         } else {
             format!("{base}-restored-{suffix}")
         };
-        if run(&["has-session", "-t", &format!("={name}")]).is_err() {
+        if !reserved.contains(&name) && session_name_available(&name) {
             return Ok(name);
         }
     }
     bail!("no available session name for {preferred}")
+}
+
+fn session_name_available(name: &str) -> bool {
+    run(&["has-session", "-t", &format!("={name}")]).is_err()
 }

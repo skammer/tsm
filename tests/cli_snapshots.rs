@@ -20,23 +20,23 @@ fn fixture(dir: &TempDir, id: &str, name: &str) -> Value {
                 "command_line": "sh", "argv": [], "start_command": "", "active": true}]
         }]}]
     });
-    fs::write(
-        dir.path().join(format!("{id}.json")),
-        serde_json::to_vec(&snapshot).unwrap(),
-    )
-    .unwrap();
+    write(dir, id, &snapshot);
     snapshot
 }
 
-fn run(dir: &TempDir, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_tsm"))
+fn command(dir: &TempDir, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tsm"));
+    command
         .args(args)
         .env("TSM_DATA_DIR", dir.path())
         .env_remove("NO_COLOR")
         .env_remove("CLICOLOR_FORCE")
-        .env_remove("FORCE_COLOR")
-        .output()
-        .unwrap()
+        .env_remove("FORCE_COLOR");
+    command
+}
+
+fn run(dir: &TempDir, args: &[&str]) -> Output {
+    command(dir, args).output().unwrap()
 }
 
 fn success(dir: &TempDir, args: &[&str]) -> String {
@@ -51,6 +51,14 @@ fn success(dir: &TempDir, args: &[&str]) -> String {
 
 fn read(dir: &TempDir, id: &str) -> Value {
     serde_json::from_slice(&fs::read(dir.path().join(format!("{id}.json"))).unwrap()).unwrap()
+}
+
+fn write(dir: &TempDir, id: &str, snapshot: &Value) {
+    fs::write(
+        dir.path().join(format!("{id}.json")),
+        serde_json::to_vec(snapshot).unwrap(),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -131,6 +139,43 @@ fn merge_creates_new_snapshot_then_updates_target_without_touching_sources() {
 }
 
 #[test]
+fn simultaneous_merges_keep_all_additions() {
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().unwrap();
+    fixture(&dir, FIRST, "Target");
+    let sources: Vec<_> = (0..8).map(|index| format!("Source {index}")).collect();
+    for (index, name) in sources.iter().enumerate() {
+        let id = format!("{index:08x}-2222-4222-8222-222222222222");
+        fixture(&dir, &id, name);
+    }
+    let children: Vec<_> = sources
+        .iter()
+        .map(|source| {
+            command(&dir, &["merge", source, "--into", "Target"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for child in children {
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let updated = read(&dir, FIRST);
+    let windows = updated["sessions"][0]["windows"].as_array().unwrap();
+    assert_eq!(windows.len(), 1 + sources.len());
+    for source in sources {
+        assert!(windows.iter().any(|window| window["name"] == source));
+    }
+}
+
+#[test]
 fn invalid_merges_and_ambiguous_delete_leave_files_unchanged() {
     let dir = tempfile::tempdir().unwrap();
     let first = fixture(&dir, FIRST, "Same");
@@ -175,11 +220,7 @@ fn inspect_filters_windows_by_index_name_and_prefix() {
                 "command_line": "tail -f x", "argv": ["tail", "-f", "x"],
                 "start_command": "", "active": true}]
         }));
-    fs::write(
-        dir.path().join(format!("{FIRST}.json")),
-        serde_json::to_vec(&snapshot).unwrap(),
-    )
-    .unwrap();
+    write(&dir, FIRST, &snapshot);
 
     for selector in ["3", "First", "fir"] {
         let shown = success(&dir, &["inspect", "First", selector]);
@@ -202,6 +243,62 @@ fn inspect_filters_windows_by_index_name_and_prefix() {
             "{selector}"
         );
     }
+}
+
+#[test]
+fn inspect_prefers_exact_window_and_reports_ambiguous_candidates() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut snapshot = fixture(&dir, FIRST, "Snapshot");
+    snapshot["scope"] = json!("all");
+    let original = &mut snapshot["sessions"][0];
+    original["windows"][0]["name"] = json!("log");
+    let mut other_session = original.clone();
+    other_session["name"] = json!("ops");
+    other_session["windows"][0]["name"] = json!("logs");
+    snapshot["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .push(other_session);
+    write(&dir, FIRST, &snapshot);
+
+    for selector in ["log", "LOG"] {
+        let exact = success(&dir, &["inspect", "Snapshot", selector]);
+        assert!(exact.contains("Window 3: log\n"));
+        assert!(!exact.contains("Window 3: logs"));
+    }
+    for selector in ["3", "lo"] {
+        let ambiguous = run(&dir, &["inspect", "Snapshot", selector]);
+        assert!(!ambiguous.status.success());
+        let error = String::from_utf8_lossy(&ambiguous.stderr);
+        assert!(error.contains("work:3 (log)"), "{error}");
+        assert!(error.contains("ops:3 (logs)"), "{error}");
+    }
+    let qualified = success(&dir, &["inspect", "Snapshot", "op:3"]);
+    assert!(qualified.contains("Window 3: logs"));
+    assert!(!qualified.contains("Session: work"));
+}
+
+#[test]
+fn full_and_displayed_ids_resolve_despite_snapshot_names() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(&dir, FIRST, "First");
+    fixture(&dir, SECOND, FIRST);
+    fixture(&dir, "cccccccc-3333-4333-8333-333333333333", "AAAAAAAA");
+    let actual_first = success(&dir, &["inspect", FIRST]);
+    assert!(actual_first.starts_with(&format!("{FIRST}  First\n")));
+    let listing = success(&dir, &["list"]);
+    let displayed_first_id = listing
+        .lines()
+        .find(|line| line.ends_with(" First"))
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap();
+    assert_eq!(displayed_first_id, "aaaaaaaa1");
+    assert_eq!(
+        success(&dir, &["inspect", displayed_first_id]),
+        actual_first
+    );
 }
 
 #[test]

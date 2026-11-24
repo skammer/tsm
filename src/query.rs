@@ -1,5 +1,5 @@
 use crate::model::Snapshot;
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 
 pub struct SnapshotQuery {
     name: String,
@@ -13,6 +13,60 @@ enum Match {
     NamePrefix,
     Substring,
     Fuzzy,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum TargetMatch {
+    Index,
+    Exact,
+    FoldedExact,
+    Prefix,
+}
+
+pub fn pick_target<T>(
+    selector: &str,
+    kind: &str,
+    candidates: impl IntoIterator<Item = T>,
+    fields: impl Fn(&T) -> (Option<usize>, &str),
+    label: impl Fn(&T) -> String,
+) -> Result<T> {
+    ensure!(!selector.is_empty(), "{kind} selector is empty");
+    let index = selector.parse::<usize>().ok();
+    let folded = selector.to_lowercase();
+    let mut best = None;
+    let mut matches = Vec::new();
+    for candidate in candidates {
+        let (candidate_index, name) = fields(&candidate);
+        let rank = if index.is_some() && index == candidate_index {
+            TargetMatch::Index
+        } else if selector == name {
+            TargetMatch::Exact
+        } else {
+            let name = name.to_lowercase();
+            if folded == name {
+                TargetMatch::FoldedExact
+            } else if name.starts_with(&folded) {
+                TargetMatch::Prefix
+            } else {
+                continue;
+            }
+        };
+        if best.is_none_or(|best| rank < best) {
+            matches.clear();
+            best = Some(rank);
+        }
+        if best == Some(rank) {
+            matches.push(candidate);
+        }
+    }
+    match matches.len() {
+        0 => bail!("no {kind} matches '{selector}'"),
+        1 => Ok(matches.remove(0)),
+        _ => bail!(
+            "ambiguous {kind} '{selector}', matches: {}",
+            matches.iter().map(label).collect::<Vec<_>>().join(", ")
+        ),
+    }
 }
 
 pub fn search(snapshots: &[Snapshot], filter: &str) -> Vec<usize> {
@@ -75,6 +129,12 @@ impl SnapshotQuery {
         if self.name.is_empty() {
             bail!("snapshot selector is empty");
         }
+        if let Some(id) = self.id.as_ref().filter(|id| id.len() == 32)
+            && let Ok(id) = id.parse::<uuid::Uuid>()
+            && let Some(snapshot) = snapshots.iter().find(|snapshot| snapshot.id == id)
+        {
+            return Ok(snapshot);
+        }
         let found: Vec<_> = snapshots
             .iter()
             .filter(|snapshot| {
@@ -102,7 +162,9 @@ pub fn short_id(snapshot: &Snapshot, all: &[Snapshot]) -> String {
     for length in 8..32 {
         let prefix = &full[..length];
         if !all.iter().any(|other| {
-            other.id != snapshot.id && other.id.simple().to_string().starts_with(prefix)
+            other.id != snapshot.id
+                && (other.id.simple().to_string().starts_with(prefix)
+                    || other.name.eq_ignore_ascii_case(prefix))
         }) {
             return prefix.to_owned();
         }

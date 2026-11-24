@@ -8,6 +8,7 @@ use ratatui::{
 
 use super::{
     app::{App, Focus, Mode},
+    display_value,
     inspect::snapshot_lines,
     single_line,
 };
@@ -35,33 +36,85 @@ pub(super) fn render(frame: &mut Frame, app: &mut App) {
     ]);
     let search_width = search.width() as u16;
     let (footer, save_cursor) = footer(app, area.width);
-    let footer_height = (footer
+    let footer_height = footer
         .line_count(area.width)
-        .min(usize::from(area.height / 2)) as u16)
-        .max(1);
+        .min(usize::from((area.height / 2).max(1))) as u16;
+    let show_search = matches!(
+        app.mode,
+        Mode::Browse | Mode::Filter { .. } | Mode::Save { .. }
+    ) && area.height > 1;
     let [head, body, foot] = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(u16::from(show_search)),
         Constraint::Fill(1),
         Constraint::Length(footer_height),
     ])
     .areas(area);
-    frame.render_widget(Paragraph::new(search), head);
+    if show_search {
+        frame.render_widget(Paragraph::new(search), head);
+    }
 
-    if matches!(app.mode, Mode::Help { .. }) {
-        render_help(frame, body, app);
-    } else if app.compact {
-        match app.focus {
+    match &mut app.mode {
+        Mode::Help { scroll } => {
+            let document = Paragraph::new(help_lines(&app.warnings)).wrap(WRAP);
+            app.page_height = render_document(
+                frame,
+                body,
+                panel("Keyboard shortcuts".into(), true),
+                document,
+                scroll,
+            );
+        }
+        Mode::Delete => {
+            let name = app
+                .selected()
+                .map_or_else(String::new, |snapshot| single_line(&snapshot.name));
+            frame.render_widget(
+                Paragraph::new(name)
+                    .style(Style::new().fg(Color::Yellow))
+                    .wrap(WRAP)
+                    .block(panel("Delete snapshot?".into(), true)),
+                body,
+            );
+        }
+        Mode::ErrorDetails { scroll } => {
+            let details = app
+                .status
+                .as_ref()
+                .and_then(|status| status.details.as_deref())
+                .unwrap_or_default();
+            let lines: Vec<_> = details
+                .lines()
+                .map(|line| Line::from(display_value(line)))
+                .collect();
+            app.page_height = render_document(
+                frame,
+                body,
+                panel("Error details".into(), true),
+                Paragraph::new(lines).wrap(WRAP),
+                scroll,
+            );
+        }
+        Mode::RestoreWorking { message, .. } => {
+            frame.render_widget(
+                Paragraph::new(single_line(message))
+                    .wrap(WRAP)
+                    .block(panel("Restoring".into(), true)),
+                body,
+            );
+        }
+        _ if app.compact => match app.focus {
             Focus::List => render_list(frame, body, app),
             Focus::Inspector => render_inspector(frame, body, app),
+        },
+        _ => {
+            let [list, inspector] = Layout::horizontal([
+                Constraint::Length((body.width / 3).max(28)),
+                Constraint::Fill(1),
+            ])
+            .areas(body);
+            render_list(frame, list, app);
+            render_inspector(frame, inspector, app);
         }
-    } else {
-        let [list, inspector] = Layout::horizontal([
-            Constraint::Length((body.width / 3).max(28)),
-            Constraint::Fill(1),
-        ])
-        .areas(body);
-        render_list(frame, list, app);
-        render_inspector(frame, inspector, app);
     }
     frame.render_widget(footer, foot);
     if filtering && !head.is_empty() && search_width < head.width {
@@ -99,6 +152,8 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
     if app.visible.is_empty() {
         let message = if app.all.is_empty() {
             "No snapshots yet.\nPress w, s or a to save."
+        } else if matches!(app.mode, Mode::Filter { .. }) {
+            "No matches.\nTry a different name or ID."
         } else {
             "No matches.\nPress Esc to clear the filter."
         };
@@ -137,36 +192,49 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
 
 fn render_inspector(frame: &mut Frame, area: Rect, app: &mut App) {
     let focused = app.focus == Focus::Inspector;
-    let title = if app.expanded {
+    let title = if app.details {
         "Inspector · details"
     } else {
         "Inspector"
     };
     let block = panel(title.into(), focused);
     let inner = block.inner(area);
-    let lines = app
-        .selected()
-        .map_or_else(Vec::new, |snapshot| snapshot_lines(snapshot, app.expanded));
-    let inspector = Paragraph::new(lines).wrap(WRAP);
-    let hidden_rows = inspector
-        .line_count(inner.width)
-        .saturating_sub(usize::from(inner.height));
-    app.scroll = app
-        .scroll
-        .min(hidden_rows.min(usize::from(u16::MAX)) as u16);
-    app.page_height = inner.height.saturating_sub(1).max(1);
-    let block = if hidden_rows > 0 && !inner.is_empty() {
-        block.title_bottom(
-            Line::styled(
-                format!(" {}/{} ", usize::from(app.scroll) + 1, hidden_rows + 1),
-                HINT,
-            )
-            .right_aligned(),
-        )
+    let lines = if let Some(snapshot) = app.selected() {
+        let mut document = snapshot_lines(snapshot, &app.outline, app.details);
+        app.outline
+            .sync(document.headings.iter().map(|(section, _)| *section));
+        if focused
+            && let Some(selected) = app.outline.selected()
+            && let Some((_, heading)) = document
+                .headings
+                .iter()
+                .find(|(section, _)| *section == selected)
+        {
+            if std::mem::take(&mut app.outline.reveal) && !inner.is_empty() {
+                let row = Paragraph::new(document.lines[..*heading].to_vec())
+                    .wrap(WRAP)
+                    .line_count(inner.width)
+                    .min(usize::from(u16::MAX)) as u16;
+                app.scroll = app
+                    .scroll
+                    .min(row)
+                    .max(row.saturating_sub(inner.height - 1));
+            }
+            document.lines[*heading] = document.lines[*heading]
+                .clone()
+                .patch_style(BOLD.add_modifier(Modifier::REVERSED));
+        }
+        document.lines
     } else {
-        block
+        vec![Line::from("Select a snapshot to inspect it.")]
     };
-    frame.render_widget(inspector.block(block).scroll((app.scroll, 0)), area);
+    app.page_height = render_document(
+        frame,
+        area,
+        block,
+        Paragraph::new(lines).wrap(WRAP),
+        &mut app.scroll,
+    );
 }
 
 fn footer(app: &App, width: u16) -> (Paragraph<'static>, Option<u16>) {
@@ -184,30 +252,24 @@ fn footer(app: &App, width: u16) -> (Paragraph<'static>, Option<u16>) {
                 hint("Enter save (blank uses default) · Esc cancel · Ctrl-U clear"),
             ]
         }
-        Mode::Delete => vec![
-            Line::styled(
-                format!(
-                    "Delete “{}”?",
-                    app.selected()
-                        .map_or_else(String::new, |snapshot| single_line(&snapshot.name))
-                ),
-                Style::new().fg(Color::Yellow),
-            ),
-            hint("y confirm · n/Esc cancel"),
-        ],
+        Mode::Delete => vec![hint(if width < 24 {
+            "y yes · Esc no"
+        } else {
+            "y confirm · n/Esc cancel"
+        })],
         Mode::Help { .. } => vec![hint("↑↓ scroll · ? / Esc close")],
+        Mode::ErrorDetails { .. } => vec![hint("↑↓ scroll · Esc close")],
+        Mode::RestoreWorking { .. } => vec![],
         Mode::Browse => {
             let mut lines = Vec::new();
             if let Some(status) = &app.status {
-                let color = if status.error {
-                    Color::Red
+                let message = single_line(&status.message);
+                let (message, color) = if status.details.is_some() {
+                    (format!("e details · {message}"), Color::Red)
                 } else {
-                    Color::Green
+                    (message, Color::Green)
                 };
-                lines.push(Line::styled(
-                    single_line(&status.message),
-                    Style::new().fg(color),
-                ));
+                lines.push(Line::styled(message, Style::new().fg(color)));
             }
             if !app.warnings.is_empty() {
                 lines.push(Line::styled(
@@ -216,11 +278,13 @@ fn footer(app: &App, width: u16) -> (Paragraph<'static>, Option<u16>) {
                 ));
             }
             lines.push(if app.compact && app.focus == Focus::Inspector {
-                hint("↑↓ scroll · Tab list · i details · ?")
+                hint("↑↓ · ←→ fold/open · Tab list · R jump · ?")
             } else if app.compact {
-                hint("↑↓ move · Tab inspect · / filter · ?")
+                hint("↑↓ move · Tab inspect · R jump · / · ?")
+            } else if app.focus == Focus::Inspector {
+                hint("↑↓ sections · ←→ fold/open · Tab list · i details · r restore · R jump · ? help")
             } else {
-                hint("↑↓ move · Tab focus · / filter · i details · r restore · w/s/a save · ? help · q quit")
+                hint("↑↓ move · Tab focus · / filter · r restore · R jump · w/s/a save · ? help · q quit")
             });
             lines
         }
@@ -228,43 +292,62 @@ fn footer(app: &App, width: u16) -> (Paragraph<'static>, Option<u16>) {
     (Paragraph::new(lines).wrap(WRAP), cursor)
 }
 
-fn render_help(frame: &mut Frame, area: Rect, app: &mut App) {
+fn help_lines(warnings: &[String]) -> Vec<Line<'static>> {
     let mut lines = vec![
-        Line::from("↑/↓ or j/k      Move selection or scroll"),
-        Line::from("PgUp/PgDn       Page through inspector or compact list"),
+        Line::from("↑/↓ or j/k      Select a snapshot or section"),
+        Line::from("←/→             Fold/open an inspector section"),
+        Line::from("PgUp/PgDn       Scroll inspector or compact list"),
         Line::from("Home/End        Jump to start/end"),
         Line::from("Tab/Enter       Switch list and inspector"),
         Line::from("/               Fuzzy name search or ID prefix"),
-        Line::from("i               Toggle details"),
+        Line::from("i               Toggle technical details"),
         Line::from("r               Restore selected snapshot"),
+        Line::from("R               Restore and jump to the result"),
+        Line::from("e               View error details"),
         Line::from("w / s / a       Save window / session / all"),
         Line::from("d / Delete      Delete selected snapshot"),
         Line::from("g               Reload snapshots"),
         Line::from("q / Ctrl-C      Quit"),
     ];
-    if !app.warnings.is_empty() {
+    if !warnings.is_empty() {
         lines.push(Line::styled(
             "Storage warnings",
             Style::new().fg(Color::Yellow),
         ));
         lines.extend(
-            app.warnings
+            warnings
                 .iter()
                 .map(|warning| Line::from(single_line(warning))),
         );
     }
-    let block = panel("Keyboard shortcuts".into(), true);
+    lines
+}
+
+fn render_document(
+    frame: &mut Frame,
+    area: Rect,
+    block: Block<'static>,
+    document: Paragraph<'static>,
+    scroll: &mut u16,
+) -> u16 {
     let inner = block.inner(area);
-    let help = Paragraph::new(lines).wrap(WRAP);
-    let hidden_rows = help
+    let hidden_rows = document
         .line_count(inner.width)
         .saturating_sub(usize::from(inner.height));
-    let Mode::Help { scroll } = &mut app.mode else {
-        return;
-    };
     *scroll = (*scroll).min(hidden_rows.min(usize::from(u16::MAX)) as u16);
-    app.page_height = inner.height.saturating_sub(1).max(1);
-    frame.render_widget(help.block(block).scroll((*scroll, 0)), area);
+    let block = if hidden_rows > 0 && !inner.is_empty() {
+        block.title_bottom(
+            Line::styled(
+                format!(" {}/{} ", usize::from(*scroll) + 1, hidden_rows + 1),
+                HINT,
+            )
+            .right_aligned(),
+        )
+    } else {
+        block
+    };
+    frame.render_widget(document.block(block).scroll((*scroll, 0)), area);
+    inner.height.saturating_sub(1).max(1)
 }
 
 fn input_tail(value: &str, width: u16) -> String {

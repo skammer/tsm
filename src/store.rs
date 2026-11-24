@@ -4,7 +4,8 @@ use directories::ProjectDirs;
 use std::{
     cmp::Reverse,
     env, fs,
-    io::{ErrorKind, Write},
+    io::{self, ErrorKind, Write},
+    os::fd::AsRawFd,
     path::PathBuf,
 };
 
@@ -42,13 +43,39 @@ impl Store {
         self.write(snapshot, false)
     }
 
-    pub fn replace(&self, snapshot: &Snapshot) -> Result<()> {
-        self.write(snapshot, true)
+    pub fn update(
+        &self,
+        change: impl FnOnce(&Catalog) -> Result<Snapshot>,
+    ) -> Result<(Snapshot, Catalog)> {
+        let _lock = self.lock()?;
+        let catalog = self.load()?;
+        let snapshot = change(&catalog)?;
+        self.write(&snapshot, true)?;
+        Ok((snapshot, catalog))
     }
 
     pub fn delete(&self, snapshot: &Snapshot) -> Result<()> {
+        let _lock = self.lock()?;
         let path = self.dir.join(format!("{}.json", snapshot.id));
         fs::remove_file(&path).with_context(|| format!("delete {}", path.display()))
+    }
+
+    fn lock(&self) -> Result<fs::File> {
+        // Lock the directory because replacing a snapshot changes its inode.
+        // Closing this descriptor releases the lock, including on failure.
+        let dir = fs::File::open(&self.dir)
+            .with_context(|| format!("open snapshot directory {}", self.dir.display()))?;
+        loop {
+            // SAFETY: dir owns a valid descriptor and stays open while locked.
+            if unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Ok(dir);
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != ErrorKind::Interrupted {
+                return Err(error)
+                    .with_context(|| format!("lock snapshot directory {}", self.dir.display()));
+            }
+        }
     }
 
     fn write(&self, snapshot: &Snapshot, replace: bool) -> Result<()> {
