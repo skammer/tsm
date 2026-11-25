@@ -4,6 +4,8 @@
 
 A tmux snapshot manager written in Rust. macOS / Linux, tmux 3.3+.
 
+![tsm snapshot browser and inspector with demo data](docs/screenshot.png)
+
 ## Getting started
 
 ```sh
